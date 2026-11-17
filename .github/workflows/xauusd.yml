@@ -1,0 +1,49 @@
+name: APEX-QUANT-OMNI v40.0 XAUUSD Engine
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quant-signal-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Quantitative Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute APEX-QUANT-OMNI v40.0 Engine
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ACCOUNT_BALANCE: "10000.0"
+          RISK_PERCENTAGE: "0.01"
+        run: |
+          python xauusd.py
+
+      - name: Upload Backtest Performance Chart & Forensic DB
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-quant-forensic-artifacts-${{ github.run_number }}
+          path: |
+            backtest_performance.png
+            trading_signals.db
+          retention-days: 30
