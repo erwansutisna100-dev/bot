@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   run-quant-engine:
-    name: Execute XAUUSD Quant Engine & Dispatch Signals
+    name: Execute XAUUSD Quant Engine
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -37,6 +37,23 @@ jobs:
           restore-keys: |
             xauusd-sqlite-db-
 
+      - name: Verify Telegram Credentials
+        continue-on-error: true
+        run: |
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN kosong"
+            exit 0
+          fi
+          GETME=$(curl -sS --max-time 15 \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe") || true
+          if echo "$GETME" | grep -q '"ok":true'; then
+            echo "✅ Token valid"
+          else
+            echo "::warning::Token invalid: $(echo "$GETME" | head -c 200)"
+          fi
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
       - name: Run APEX-QUANT-OMNI ENTERPRISE v40.0
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -45,14 +62,13 @@ jobs:
           ACCOUNT_BALANCE: "10000.0"
           RISK_PERCENTAGE: "1.0"
           MPLBACKEND: "Agg"
-        run: |
-          python main.py
+        run: python main.py
 
-      - name: Upload Backtest Chart & SQLite Forensic Artifacts
+      - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: apex-quant-omni-artifacts-${{ github.run_number }}
+          name: apex-artifacts-${{ github.run_number }}
           path: |
             backtest_performance.png
             trading_signals.db
