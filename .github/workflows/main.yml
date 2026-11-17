@@ -43,23 +43,65 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ─── Verifikasi Telegram (opsional, bisa dihapus setelah tes) ───
+      # ═══════════════════════════════════════════════════════════════════
+      #  VERIFIKASI TELEGRAM — warning-only, tidak memblokir bot
+      #  Hapus blok ini kalau sudah yakin token valid dan tidak butuh log
+      # ═══════════════════════════════════════════════════════════════════
       - name: Verify Telegram credentials
         continue-on-error: true
         run: |
-          set -uo pipefail
-          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-            echo "::warning::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID kosong."
+          echo "▶ Memeriksa TELEGRAM_BOT_TOKEN dan TELEGRAM_CHAT_ID..."
+
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN kosong di Secrets"
             exit 0
           fi
-          GETME=$(curl -sS --max-time 15 \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe") || true
-          if echo "$GETME" | jq -e '.ok == true' >/dev/null 2>&1; then
-            echo "✅ Token valid (bot: @$(echo "$GETME" | jq -r '.result.username'))"
-          else
-            echo "::warning::Token Telegram INVALID: $(echo "$GETME" | jq -r '.description // "network"')"
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::warning::TELEGRAM_CHAT_ID kosong di Secrets"
+            exit 0
           fi
-      # ────────────────────────────────────────────────────────────────
+
+          # ── Cek 1: token via getMe ────────────────────────────────
+          GETME=$(curl -sS --max-time 15 \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe") || {
+            echo "::warning::Tidak bisa menghubungi api.telegram.org (network)"
+            exit 0
+          }
+
+          OK=$(printf '%s' "$GETME" | python3 -c \
+            "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")
+
+          if [ "$OK" != "True" ]; then
+            DESC=$(printf '%s' "$GETME" | python3 -c \
+              "import sys,json; print(json.load(sys.stdin).get('description','unknown'))" 2>/dev/null || echo "parse-error")
+            echo "::warning::TOKEN TELEGRAM INVALID → ${DESC}"
+            exit 0
+          fi
+
+          BOT_USER=$(printf '%s' "$GETME" | python3 -c \
+            "import sys,json; r=json.load(sys.stdin).get('result',{}); print(r.get('username','?'))" 2>/dev/null || echo "?")
+          echo "✅ Token valid — bot: @${BOT_USER}"
+
+          # ── Cek 2: chat_id bisa diakses (tanpa kirim pesan) ───────
+          # Pakai getChat: tidak kirim pesan, hanya verifikasi bot punya akses
+          GETCHAT=$(curl -sS --max-time 15 \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getChat?chat_id=${TELEGRAM_CHAT_ID}") || true
+
+          CHAT_OK=$(printf '%s' "$GETCHAT" | python3 -c \
+            "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")
+
+          if [ "$CHAT_OK" = "True" ]; then
+            CHAT_TITLE=$(printf '%s' "$GETCHAT" | python3 -c \
+              "import sys,json; r=json.load(sys.stdin).get('result',{}); print(r.get('title') or r.get('first_name') or r.get('username') or r.get('id'))" 2>/dev/null || echo "?")
+            echo "✅ Chat ID valid — target: ${CHAT_TITLE}"
+            echo "🎯 Telegram siap menerima sinyal."
+          else
+            DESC=$(printf '%s' "$GETCHAT" | python3 -c \
+              "import sys,json; print(json.load(sys.stdin).get('description','unknown'))" 2>/dev/null || echo "parse-error")
+            echo "::warning::CHAT_ID INVALID → ${DESC}"
+            echo "   Perbaiki: pastikan chat_id benar & bot tidak diblokir."
+          fi
+      # ═══════════════════════════════════════════════════════════════════
 
       - name: Run APEX-QUANT-OMNI bot
         run: python main.py
