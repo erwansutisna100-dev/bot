@@ -1,4 +1,4 @@
-name: APEX-QUANT-OMNI XAUUSD Signal Engine
+name: bot
 
 on:
   schedule:
