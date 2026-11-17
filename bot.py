@@ -3,9 +3,12 @@ matplotlib.use("Agg")
 
 import concurrent.futures
 import datetime as dt
+import json
+import lzma
 import math
 import os
 import sqlite3
+import struct
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -16,6 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
 import yfinance as yf
 
 
@@ -23,7 +27,8 @@ import yfinance as yf
 # ENTERPRISE CONFIGURATION & CONSTANTS
 # ==============================================================================
 ENGINE_NAME = "APEX-QUANT-OMNI ENTERPRISE v40.0"
-TICKER = "XAUUSD=X"
+PRIMARY_TICKER = "XAUUSD=X"
+SPOT_YFINANCE_PROXIES = ["PAXG-USD", "XAUT-USD"]
 DB_PATH = os.getenv("SQLITE_DB_PATH", "trading_signals.db")
 CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
 
@@ -44,6 +49,11 @@ CONFLUENCE_THRESHOLD = 65.0
 ATR_GRID = [10, 14, 20]
 Z_THRESHOLD_GRID = [1.5, 2.0, 2.5]
 Z_LOOKBACK_WINDOW = 20
+
+DUKASCOPY_DAYS_LOOKBACK = 21
+DUKASCOPY_RECORD_FMT = ">3I2f"
+DUKASCOPY_RECORD_SIZE = struct.calcsize(DUKASCOPY_RECORD_FMT)
+DUKASCOPY_PRICE_DIVISOR = 1000.0
 
 CIRCUIT_BREAKER_MAX_STALE_HOURS = 96.0
 CIRCUIT_BREAKER_MAX_BAR_JUMP_PCT = 0.08
@@ -88,6 +98,7 @@ class QuantitativeSignal:
     risk_usd: float
     rrr_tp3: float
     trailing_protocol: str
+    feed_source: str
     timestamp_utc: str
     pillar_breakdown: Dict[str, Any] = field(default_factory=dict)
 
@@ -162,6 +173,7 @@ def init_sqlite_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp_utc TEXT NOT NULL,
             asset TEXT NOT NULL,
+            feed_source TEXT NOT NULL DEFAULT 'UNKNOWN',
             decision TEXT NOT NULL,
             entry_price REAL NOT NULL,
             stop_loss REAL NOT NULL,
@@ -187,6 +199,15 @@ def init_sqlite_db(db_path: str = DB_PATH) -> sqlite3.Connection:
         );
         """
     )
+    # Forward-compatible migration if DB was initialized by earlier schema
+    existing_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(signal_audit_log);").fetchall()
+    }
+    if "feed_source" not in existing_cols:
+        conn.execute(
+            "ALTER TABLE signal_audit_log ADD COLUMN feed_source TEXT NOT NULL DEFAULT 'UNKNOWN';"
+        )
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS active_positions (
@@ -224,14 +245,12 @@ def forensic_audit_log(
     Outputs raw mathematical diagnostics to stdout AND persists every evaluation
     to SQLite prior to webhook dispatch.
     """
-    import json
-
     raw_payload_json = json.dumps(raw_math, default=str)
 
     print("\n" + "=" * 78)
     print(f"FORENSIC AUDIT REPORT | {ENGINE_NAME} | {signal.timestamp_utc}")
     print("=" * 78)
-    print(f"Asset                : XAUUSD (SPOT GOLD) [{TICKER}]")
+    print(f"Asset                : XAUUSD (SPOT GOLD) [{signal.feed_source}]")
     print(f"Signal Decision      : {signal.decision}")
     print(f"Market Regime        : {signal.market_regime}")
     print(f"Confluence Score     : {signal.confluence_score:.2f} / 100.00")
@@ -252,17 +271,18 @@ def forensic_audit_log(
         cursor.execute(
             """
             INSERT INTO signal_audit_log (
-                timestamp_utc, asset, decision, entry_price, stop_loss,
+                timestamp_utc, asset, feed_source, decision, entry_price, stop_loss,
                 tp1, tp2, tp3, trailing_protocol, optimal_atr_period,
                 optimal_z_threshold, recommended_lot, risk_usd, market_regime,
                 confluence_score, z_score, atr_value, smc_bias,
                 order_flow_score, htf_alignment, win_rate, profit_factor,
                 max_drawdown, raw_forensic_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             (
                 signal.timestamp_utc,
                 "XAUUSD",
+                signal.feed_source,
                 signal.decision,
                 round(signal.entry_price, 4),
                 round(signal.stop_loss, 4),
@@ -295,12 +315,12 @@ def forensic_audit_log(
 
 
 # ==============================================================================
-# DATA PIPELINE & MULTI-INDEX CLEANING + CIRCUIT BREAKER
+# MULTI-TIER SPOT GOLD DATA PIPELINE + MULTI-INDEX CLEANING + CIRCUIT BREAKER
 # ==============================================================================
-def clean_yfinance_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Flattens yfinance MultiIndex columns, enforces UTC timestamps, removes
-    corrupted/duplicate rows, and guarantees numeric OHLCV structure.
+    Standardizes OHLCV columns, enforces UTC nanosecond DatetimeIndex,
+    deduplicates timestamps, and enforces candle high/low integrity.
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -315,7 +335,7 @@ def clean_yfinance_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     required_cols = ["Open", "High", "Low", "Close"]
     for col in required_cols:
         if col not in df.columns:
-            raise CircuitBreakerTripped(f"Missing required OHLC column '{col}' from yfinance feed.")
+            return pd.DataFrame()
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "Volume" not in df.columns:
@@ -323,24 +343,41 @@ def clean_yfinance_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
 
-    df.index = pd.to_datetime(df.index, utc=True)
+    idx = pd.to_datetime(df.index, utc=True)
+    df.index = pd.DatetimeIndex(idx).as_unit("ns")
+    df.index.name = "Timestamp"
+
     df = df[~df.index.duplicated(keep="last")]
     df = df.sort_index()
     df = df.dropna(subset=required_cols)
 
-    # Enforce High >= max(Open, Close) and Low <= min(Open, Close)
     df = df[(df["Close"] > 0.0) & (df["Open"] > 0.0) & (df["High"] > 0.0) & (df["Low"] > 0.0)]
+    if df.empty:
+        return pd.DataFrame()
+
     df["High"] = np.maximum(df["High"], np.maximum(df["Open"], df["Close"]))
     df["Low"] = np.minimum(df["Low"], np.minimum(df["Open"], df["Close"]))
 
     return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
-def fetch_spot_gold_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Pulls free Spot Gold (XAUUSD=X) 15m and 1h OHLCV data via yfinance."""
+def clean_yfinance_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flattens yfinance MultiIndex columns and applies strict OHLCV sanitization.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return normalize_ohlcv_dataframe(df)
+
+
+def _try_yfinance_ticker(ticker: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Attempts to download 15m and 1h OHLCV cleanly via yfinance."""
     try:
         raw_15m = yf.download(
-            tickers=TICKER,
+            tickers=ticker,
             period="60d",
             interval="15m",
             auto_adjust=False,
@@ -348,32 +385,189 @@ def fetch_spot_gold_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
             threads=False,
         )
         raw_1h = yf.download(
-            tickers=TICKER,
+            tickers=ticker,
             period="180d",
             interval="1h",
             auto_adjust=False,
             progress=False,
             threads=False,
         )
-    except Exception as net_exc:
-        raise CircuitBreakerTripped(f"yfinance network failure for {TICKER}: {net_exc}") from net_exc
+        return clean_yfinance_dataframe(raw_15m), clean_yfinance_dataframe(raw_1h)
+    except Exception as exc:
+        print(f"[DATA] yfinance attempt for {ticker} failed: {exc}")
+        return pd.DataFrame(), pd.DataFrame()
 
-    df_15m = clean_yfinance_dataframe(raw_15m)
-    df_1h = clean_yfinance_dataframe(raw_1h)
 
-    run_circuit_breaker(df_15m, df_1h)
-    return df_15m, df_1h
+def _fetch_dukascopy_hour(
+    session: requests.Session, hour_dt: dt.datetime
+) -> List[Tuple[pd.Timestamp, float, float]]:
+    """Downloads and decodes a single Dukascopy XAUUSD hourly .bi5 LZMA tick file."""
+    url = (
+        f"https://datafeed.dukascopy.com/datafeed/XAUUSD/"
+        f"{hour_dt.year}/{hour_dt.month - 1:02d}/{hour_dt.day:02d}/{hour_dt.hour:02d}h_ticks.bi5"
+    )
+    try:
+        resp = session.get(url, timeout=8)
+        if resp.status_code != 200 or not resp.content:
+            return []
+        raw = lzma.decompress(resp.content)
+        rows: List[Tuple[pd.Timestamp, float, float]] = []
+        base_ts = pd.Timestamp(hour_dt)
+        for offset in range(0, len(raw) - (len(raw) % DUKASCOPY_RECORD_SIZE), DUKASCOPY_RECORD_SIZE):
+            ms_offset, raw_ask, raw_bid, ask_vol, bid_vol = struct.unpack(
+                DUKASCOPY_RECORD_FMT, raw[offset : offset + DUKASCOPY_RECORD_SIZE]
+            )
+            mid_px = ((raw_ask + raw_bid) * 0.5) / DUKASCOPY_PRICE_DIVISOR
+            if mid_px <= 0.0:
+                continue
+            tick_ts = base_ts + pd.Timedelta(milliseconds=int(ms_offset))
+            vol = float(ask_vol + bid_vol)
+            rows.append((tick_ts, mid_px, vol))
+        return rows
+    except Exception:
+        return []
+
+
+def _try_dukascopy_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Pulls institutional Spot Gold (XAUUSD) tick data from Dukascopy's public
+    registration-free feed and resamples to 15m and 1h OHLCV.
+    """
+    print("[DATA] Querying Dukascopy institutional Spot Gold (XAUUSD) feed...")
+    now_utc = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+    hours_back = DUKASCOPY_DAYS_LOOKBACK * 24
+    hour_list = [now_utc - dt.timedelta(hours=h) for h in range(1, hours_back + 1)]
+
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    all_ticks: List[Tuple[pd.Timestamp, float, float]] = []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            for chunk in pool.map(lambda h: _fetch_dukascopy_hour(session, h), hour_list):
+                if chunk:
+                    all_ticks.extend(chunk)
+    finally:
+        session.close()
+
+    if len(all_ticks) < 500:
+        return pd.DataFrame(), pd.DataFrame()
+
+    tick_df = pd.DataFrame(all_ticks, columns=["Timestamp", "Price", "Volume"])
+    tick_df["Timestamp"] = pd.to_datetime(tick_df["Timestamp"], utc=True)
+    tick_df = tick_df.set_index("Timestamp").sort_index()
+
+    agg_spec = {"Price": ["first", "max", "min", "last"], "Volume": "sum"}
+
+    df_15m_raw = tick_df.resample("15min").agg(agg_spec).dropna(subset=[("Price", "first")])
+    df_15m_raw.columns = ["Open", "High", "Low", "Close", "Volume"]
+
+    df_1h_raw = tick_df.resample("1h").agg(agg_spec).dropna(subset=[("Price", "first")])
+    df_1h_raw.columns = ["Open", "High", "Low", "Close", "Volume"]
+
+    return normalize_ohlcv_dataframe(df_15m_raw), normalize_ohlcv_dataframe(df_1h_raw)
+
+
+def _try_kraken_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Pulls live 15m & 1h physical-gold-backed PAXGUSD OHLCV from Kraken's
+    public unauthenticated REST API.
+    """
+    print("[DATA] Querying Kraken public Spot Gold proxy (PAXGUSD) feed...")
+    url = "https://api.kraken.com/0/public/OHLC"
+
+    def _pull_interval(interval_min: int) -> pd.DataFrame:
+        resp = requests.get(
+            url,
+            params={"pair": "PAXGUSD", "interval": interval_min},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("error"):
+            raise RuntimeError(f"Kraken API error: {payload['error']}")
+        result = payload.get("result", {})
+        pair_keys = [k for k in result.keys() if k != "last"]
+        if not pair_keys:
+            return pd.DataFrame()
+        candles = result[pair_keys[0]]
+        df = pd.DataFrame(
+            candles,
+            columns=["Time", "Open", "High", "Low", "Close", "VWAP", "Volume", "Count"],
+        )
+        df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True)
+        df = df.set_index("Time")
+        return normalize_ohlcv_dataframe(df[["Open", "High", "Low", "Close", "Volume"]])
+
+    try:
+        return _pull_interval(15), _pull_interval(60)
+    except Exception as exc:
+        print(f"[DATA] Kraken PAXGUSD feed failed: {exc}")
+        return pd.DataFrame(), pd.DataFrame()
+
+
+def _is_valid_feed(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> bool:
+    if df_15m.empty or df_1h.empty:
+        return False
+    if len(df_15m) < 120 or len(df_1h) < 60:
+        return False
+    last_ts = df_15m.index[-1].to_pydatetime()
+    staleness_h = (dt.datetime.now(dt.timezone.utc) - last_ts).total_seconds() / 3600.0
+    return staleness_h <= CIRCUIT_BREAKER_MAX_STALE_HOURS
+
+
+def fetch_spot_gold_data() -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+    """
+    Executes a 100% free, registration-free Spot Gold data waterfall
+    (strictly avoiding futures GC=F):
+      1. yfinance XAUUSD=X
+      2. Dukascopy Institutional Spot XAUUSD (.bi5 ticks)
+      3. yfinance Physical-Gold Spot Proxy (PAXG-USD / XAUT-USD)
+      4. Kraken Public Spot Proxy (PAXGUSD)
+    """
+    # Tier 1: yfinance XAUUSD=X
+    df_15m, df_1h = _try_yfinance_ticker(PRIMARY_TICKER)
+    if _is_valid_feed(df_15m, df_1h):
+        run_circuit_breaker(df_15m, df_1h)
+        return df_15m, df_1h, f"yfinance ({PRIMARY_TICKER})"
+
+    print(f"[DATA] Primary ticker {PRIMARY_TICKER} unavailable; engaging Spot Gold fallback waterfall...")
+
+    # Tier 2: Dukascopy Institutional Spot XAUUSD
+    df_15m, df_1h = _try_dukascopy_spot_gold()
+    if _is_valid_feed(df_15m, df_1h):
+        run_circuit_breaker(df_15m, df_1h)
+        return df_15m, df_1h, "Dukascopy Spot XAUUSD"
+
+    # Tier 3: yfinance Physical-Gold-Backed Spot Tokens (No Futures GC=F)
+    for proxy_ticker in SPOT_YFINANCE_PROXIES:
+        df_15m, df_1h = _try_yfinance_ticker(proxy_ticker)
+        if _is_valid_feed(df_15m, df_1h):
+            run_circuit_breaker(df_15m, df_1h)
+            return df_15m, df_1h, f"yfinance Spot Gold ({proxy_ticker})"
+
+    # Tier 4: Kraken Public REST API PAXGUSD
+    df_15m, df_1h = _try_kraken_spot_gold()
+    if _is_valid_feed(df_15m, df_1h):
+        run_circuit_breaker(df_15m, df_1h)
+        return df_15m, df_1h, "Kraken Public Spot (PAXGUSD)"
+
+    raise CircuitBreakerTripped(
+        "All registration-free Spot Gold feeds failed (XAUUSD=X, Dukascopy XAUUSD, PAXG-USD, XAUT-USD, Kraken PAXGUSD)."
+    )
 
 
 def run_circuit_breaker(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> None:
     """Halts execution immediately on feed starvation, stale bars, or price anomalies."""
     if df_15m.empty or len(df_15m) < 120:
         raise CircuitBreakerTripped(
-            f"Insufficient 15m bars for {TICKER}: got {len(df_15m)} (need >= 120)."
+            f"Insufficient 15m bars for XAUUSD: got {len(df_15m)} (need >= 120)."
         )
     if df_1h.empty or len(df_1h) < 60:
         raise CircuitBreakerTripped(
-            f"Insufficient 1h bars for {TICKER}: got {len(df_1h)} (need >= 60)."
+            f"Insufficient 1h bars for XAUUSD: got {len(df_1h)} (need >= 60)."
         )
 
     last_ts = df_15m.index[-1]
@@ -424,8 +618,16 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
     atr = compute_atr(df, period)
-    plus_di = 100.0 * pd.Series(plus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / (atr + EPSILON)
-    minus_di = 100.0 * pd.Series(minus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / (atr + EPSILON)
+    plus_di = (
+        100.0
+        * pd.Series(plus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean()
+        / (atr + EPSILON)
+    )
+    minus_di = (
+        100.0
+        * pd.Series(minus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean()
+        / (atr + EPSILON)
+    )
 
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di + EPSILON)
     adx = dx.ewm(alpha=1.0 / period, adjust=False).mean()
@@ -444,7 +646,7 @@ def compute_smc_structure(df: pd.DataFrame, swing_lookback: int = 3) -> pd.DataF
 
     last_swing_high = np.full(n, np.nan)
     last_swing_low = np.full(n, np.nan)
-    smc_bias = np.zeros(n, dtype=int)  # +1 bullish, -1 bearish
+    smc_bias = np.zeros(n, dtype=int)
     bos_bull = np.zeros(n, dtype=bool)
     bos_bear = np.zeros(n, dtype=bool)
     choch_bull = np.zeros(n, dtype=bool)
@@ -455,7 +657,6 @@ def compute_smc_structure(df: pd.DataFrame, swing_lookback: int = 3) -> pd.DataF
     curr_bias = 0
 
     for i in range(swing_lookback * 2, n):
-        # Confirmed pivot at idx = i - swing_lookback using only bars <= i
         p = i - swing_lookback
         window_h = highs[p - swing_lookback : p + swing_lookback + 1]
         window_l = lows[p - swing_lookback : p + swing_lookback + 1]
@@ -491,7 +692,7 @@ def compute_smc_structure(df: pd.DataFrame, swing_lookback: int = 3) -> pd.DataF
 
         smc_bias[i] = curr_bias
 
-    out = pd.DataFrame(
+    return pd.DataFrame(
         {
             "swing_high": last_swing_high,
             "swing_low": last_swing_low,
@@ -503,13 +704,12 @@ def compute_smc_structure(df: pd.DataFrame, swing_lookback: int = 3) -> pd.DataF
         },
         index=df.index,
     )
-    return out
 
 
 def compute_order_flow_features(df: pd.DataFrame, atr: pd.Series) -> pd.DataFrame:
     """
     Pillar II (Order Flow): Volume-weighted body-to-wick displacement ratios.
-    Falls back cleanly to range-activity weighting if spot FX Volume is 0.
+    Falls back cleanly to range-activity weighting if spot Volume is 0.
     """
     candle_range = (df["High"] - df["Low"]).abs() + EPSILON
     body = df["Close"] - df["Open"]
@@ -591,19 +791,21 @@ def enrich_features(
         ),
     )
 
+    ltf_keys = pd.DataFrame({"ts": pd.DatetimeIndex(df.index).as_unit("ns")})
+    htf_frame = htf[["HTF_EMA20", "HTF_EMA50", "HTF_Trend", "HTF_SMC_Bias"]].copy()
+    htf_frame["ts"] = pd.DatetimeIndex(htf.index).as_unit("ns")
+
     htf_aligned = pd.merge_asof(
-        df[["Close"]].reset_index().rename(columns={df.index.name or "index": "ts"}),
-        htf[["HTF_EMA20", "HTF_EMA50", "HTF_Trend", "HTF_SMC_Bias"]]
-        .reset_index()
-        .rename(columns={htf.index.name or "index": "ts"}),
+        ltf_keys,
+        htf_frame.sort_values("ts"),
         on="ts",
         direction="backward",
     ).set_index("ts")
 
-    df["HTF_EMA20"] = htf_aligned["HTF_EMA20"].bfill()
-    df["HTF_EMA50"] = htf_aligned["HTF_EMA50"].bfill()
-    df["HTF_Trend"] = htf_aligned["HTF_Trend"].fillna(0).astype(int)
-    df["HTF_SMC_Bias"] = htf_aligned["HTF_SMC_Bias"].fillna(0).astype(int)
+    df["HTF_EMA20"] = htf_aligned["HTF_EMA20"].bfill().values
+    df["HTF_EMA50"] = htf_aligned["HTF_EMA50"].bfill().values
+    df["HTF_Trend"] = htf_aligned["HTF_Trend"].fillna(0).astype(int).values
+    df["HTF_SMC_Bias"] = htf_aligned["HTF_SMC_Bias"].fillna(0).astype(int).values
 
     return df
 
@@ -625,7 +827,6 @@ def score_bar_confluence(row: pd.Series, z_threshold: float) -> Tuple[str, float
     bos_bear = bool(row["bos_bear"])
     choch_bear = bool(row["choch_bear"])
 
-    # Bullish Confluence Score
     bull_score = 0.0
     if htf_trend == 1:
         bull_score += 25.0
@@ -644,7 +845,6 @@ def score_bar_confluence(row: pd.Series, z_threshold: float) -> Tuple[str, float
     if regime_ok:
         bull_score += 10.0
 
-    # Bearish Confluence Score
     bear_score = 0.0
     if htf_trend == -1:
         bear_score += 25.0
@@ -705,7 +905,6 @@ def run_backtest_for_params(
     opens = df["Open"].values
     highs = df["High"].values
     lows = df["Low"].values
-    closes = df["Close"].values
     atrs = df["ATR"].values
     z_scores = df["Z_Score"].values
     htf_trends = df["HTF_Trend"].values
@@ -748,17 +947,16 @@ def run_backtest_for_params(
         if in_pos:
             if direction == 1:
                 best_fav = max(best_fav, h)
-                # Check SL first (conservative worst-case bar assumption)
                 if l <= sl_px:
                     exit_px = sl_px - SLIPPAGE_DOLLARS
-                    pnl_r = (exit_px - entry_px) / (pos_atr * 1.0 + EPSILON)
+                    pnl_r = (exit_px - entry_px) / (pos_atr + EPSILON)
                     pnl_usd = pnl_r * risk_dollars
                     equity += pnl_usd
                     trade_returns.append(pnl_usd)
                     in_pos = False
                 elif h >= tp3_px:
                     exit_px = tp3_px - SLIPPAGE_DOLLARS
-                    pnl_r = (exit_px - entry_px) / (pos_atr * 1.0 + EPSILON)
+                    pnl_r = (exit_px - entry_px) / (pos_atr + EPSILON)
                     pnl_usd = pnl_r * risk_dollars
                     equity += pnl_usd
                     trade_returns.append(pnl_usd)
@@ -766,7 +964,7 @@ def run_backtest_for_params(
                 else:
                     if not tp1_hit and h >= tp1_px:
                         tp1_hit = True
-                        sl_px = max(sl_px, entry_px)  # Shift to Breakeven
+                        sl_px = max(sl_px, entry_px)
                     if tp1_hit:
                         trailing_candidate = best_fav - (0.75 * pos_atr)
                         sl_px = max(sl_px, trailing_candidate)
@@ -774,14 +972,14 @@ def run_backtest_for_params(
                 best_fav = min(best_fav, l)
                 if h >= sl_px:
                     exit_px = sl_px + SLIPPAGE_DOLLARS
-                    pnl_r = (entry_px - exit_px) / (pos_atr * 1.0 + EPSILON)
+                    pnl_r = (entry_px - exit_px) / (pos_atr + EPSILON)
                     pnl_usd = pnl_r * risk_dollars
                     equity += pnl_usd
                     trade_returns.append(pnl_usd)
                     in_pos = False
                 elif l <= tp3_px:
                     exit_px = tp3_px + SLIPPAGE_DOLLARS
-                    pnl_r = (entry_px - exit_px) / (pos_atr * 1.0 + EPSILON)
+                    pnl_r = (entry_px - exit_px) / (pos_atr + EPSILON)
                     pnl_usd = pnl_r * risk_dollars
                     equity += pnl_usd
                     trade_returns.append(pnl_usd)
@@ -789,7 +987,7 @@ def run_backtest_for_params(
                 else:
                     if not tp1_hit and l <= tp1_px:
                         tp1_hit = True
-                        sl_px = min(sl_px, entry_px)  # Shift to Breakeven
+                        sl_px = min(sl_px, entry_px)
                     if tp1_hit:
                         trailing_candidate = best_fav + (0.75 * pos_atr)
                         sl_px = min(sl_px, trailing_candidate)
@@ -801,7 +999,6 @@ def run_backtest_for_params(
             curve_timestamps.append(timestamps[i])
             continue
 
-        # Entry evaluation on closed bar i -> enter at bar i+1 Open
         if not regimes[i]:
             equity_curve.append(equity)
             curve_timestamps.append(timestamps[i])
@@ -908,7 +1105,6 @@ def run_grid_search_optimization(
             metrics = run_backtest_for_params(df_15m, df_1h, atr_p, z_th)
             candidates.append(metrics)
 
-    # Prefer parameter sets with >= 5 trades; fallback to highest PF if sparse
     valid = [m for m in candidates if m.total_trades >= 5]
     pool = valid if valid else candidates
     best = max(
@@ -931,7 +1127,7 @@ def run_grid_search_optimization(
 # MATPLOTLIB BACKTEST CHART GENERATION (HEADLESS 'Agg' BACKEND)
 # ==============================================================================
 def generate_backtest_chart(
-    best_metrics: BacktestMetrics, chart_path: str = CHART_PATH
+    best_metrics: BacktestMetrics, feed_source: str, chart_path: str = CHART_PATH
 ) -> str:
     """
     Renders an institutional-grade equity curve & drawdown chart to PNG
@@ -956,10 +1152,10 @@ def generate_backtest_chart(
     ax1.axhline(ACCOUNT_BALANCE, color="#6B7280", linestyle="--", linewidth=1.0, alpha=0.7)
 
     title_str = (
-        f"{ENGINE_NAME} | XAUUSD Backtest "
+        f"{ENGINE_NAME} | XAUUSD [{feed_source}] "
         f"(ATR={best_metrics.atr_period}, Z={best_metrics.z_threshold:.1f})"
     )
-    ax1.set_title(title_str, fontsize=13, fontweight="bold", color="#F9FAFB", pad=12)
+    ax1.set_title(title_str, fontsize=12.5, fontweight="bold", color="#F9FAFB", pad=12)
     ax1.set_ylabel("Account Equity ($)", fontsize=10, color="#D1D5DB")
     ax1.grid(True, linestyle=":", linewidth=0.6, alpha=0.35, color="#4B5563")
     ax1.legend(loc="upper left", frameon=True, facecolor="#1F2937", edgecolor="#374151")
@@ -1158,8 +1354,9 @@ def evaluate_live_signal(
     df_15m: pd.DataFrame,
     df_1h: pd.DataFrame,
     best_metrics: BacktestMetrics,
+    feed_source: str,
 ) -> Tuple[QuantitativeSignal, Dict[str, Any]]:
-    """Evaluates the latest closed 15m candle using optimal Grid Search parameters."""
+    """Evaluates the latest 15m candle using optimal Grid Search parameters."""
     enriched = enrich_features(
         df_15m,
         df_1h,
@@ -1167,7 +1364,6 @@ def evaluate_live_signal(
         z_window=Z_LOOKBACK_WINDOW,
     )
 
-    # Use last completed bar (-2) if current bar (-1) is mid-formation; fallback cleanly
     eval_row = enriched.iloc[-1]
     decision, confluence, breakdown = score_bar_confluence(
         eval_row, z_threshold=best_metrics.z_threshold
@@ -1224,11 +1420,13 @@ def evaluate_live_signal(
         risk_usd=risk_usd,
         rrr_tp3=rrr_tp3,
         trailing_protocol="Active @ TP1 Breakeven",
+        feed_source=feed_source,
         timestamp_utc=ts_utc,
         pillar_breakdown=breakdown,
     )
 
     raw_math = {
+        "feed_source": feed_source,
         "latest_bar_time": str(enriched.index[-1]),
         "open": round(float(eval_row["Open"]), 4),
         "high": round(float(eval_row["High"]), 4),
@@ -1262,7 +1460,7 @@ def build_forensic_report_html(
     return (
         f"🛡️ <b>{ENGINE_NAME} (ULTIMATE EDITION)</b> 🛡️\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌟 <b>Asset:</b> XAUUSD (SPOT GOLD)\n"
+        f"🌟 <b>Asset:</b> XAUUSD (SPOT GOLD) [{signal.feed_source}]\n"
         f"📊 <b>Signal Decision:</b> {signal.decision}\n"
         f"🎯 <b>Precision Entry:</b> {signal.entry_price:.2f}\n"
         f"🛑 <b>Forensic Stop Loss:</b> {signal.stop_loss:.2f}\n"
@@ -1392,13 +1590,13 @@ def dispatch_dual_channel_webhooks(
 def main() -> int:
     conn: Optional[sqlite3.Connection] = None
     try:
-        print(f"[BOOT] Initializing {ENGINE_NAME} for {TICKER}...")
+        print(f"[BOOT] Initializing {ENGINE_NAME} (Spot Gold Pipeline)...")
         conn = init_sqlite_db(DB_PATH)
 
         # 1. Fetch & Clean Spot Gold Feed + Circuit Breaker
-        df_15m, df_1h = fetch_spot_gold_data()
+        df_15m, df_1h, feed_source = fetch_spot_gold_data()
         print(
-            f"[DATA] Loaded {len(df_15m)}x 15m bars & {len(df_1h)}x 1h bars | "
+            f"[DATA] Feed='{feed_source}' | Loaded {len(df_15m)}x 15m bars & {len(df_1h)}x 1h bars | "
             f"Latest Spot Close: {float(df_15m['Close'].iloc[-1]):.2f}"
         )
 
@@ -1406,11 +1604,11 @@ def main() -> int:
         best_metrics, _ = run_grid_search_optimization(df_15m, df_1h)
 
         # 3. Generate Headless Matplotlib Backtest Performance Chart
-        chart_status = generate_backtest_chart(best_metrics, CHART_PATH)
+        chart_status = generate_backtest_chart(best_metrics, feed_source, CHART_PATH)
         print(f"[CHART] {chart_status} -> {CHART_PATH}")
 
         # 4. Live 5-Pillar Signal Evaluation
-        signal, raw_math = evaluate_live_signal(df_15m, df_1h, best_metrics)
+        signal, raw_math = evaluate_live_signal(df_15m, df_1h, best_metrics, feed_source)
 
         # 5. Auto-Trailing Stop Management for Existing Open Positions
         latest_atr_series = compute_atr(df_15m, best_metrics.atr_period)
