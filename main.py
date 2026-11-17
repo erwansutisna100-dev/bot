@@ -36,7 +36,7 @@ from requests.adapters import HTTPAdapter
 # CONFIGURATION
 # ==============================================================================
 ENGINE_NAME = "APEX-QUANT-OMNI ENTERPRISE v40.0"
-PRIMARY_YF_TICKER = "XAUUSD=X"                                   # spec primary
+PRIMARY_YF_TICKER = "XAUUSD=X"
 TV_SYMBOLS = ["OANDA:XAUUSD", "FX_IDC:XAUUSD",
               "FOREXCOM:XAUUSD", "PEPPERSTONE:XAUUSD"]
 PROXY_TICKERS = ["PAXG-USD", "XAUT-USD"]
@@ -54,7 +54,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 EPSILON = 1e-8
 SPREAD_DOLLARS = 0.30
 SLIPPAGE_DOLLARS = 0.15
-XAU_MULT = 100.0            # 1 lot = 100 oz
+XAU_MULT = 100.0
 MIN_RRR = 3.0
 CONFLUENCE_THRESHOLD = 65.0
 ATR_GRID = [10, 14, 20]
@@ -108,7 +108,7 @@ class QuantitativeSignal:
     rrr_tp3: float
     trailing_protocol: str
     feed_source: str
-    swissquote_mid: Optional[float]
+    swissquote_spot_mid: Optional[float]
     timestamp_utc: str
     pillar_breakdown: Dict[str, Any] = field(default_factory=dict)
 
@@ -247,7 +247,7 @@ def forensic_audit_log(conn: sqlite3.Connection, signal: QuantitativeSignal,
 
 
 # ==============================================================================
-# DATA PIPELINE (XAUUSD=X primary + multi-tier fallbacks)
+# DATA PIPELINE
 # ==============================================================================
 def normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -531,35 +531,26 @@ def run_circuit_breaker(d15: pd.DataFrame, d1h: pd.DataFrame) -> None:
 
 
 def fetch_spot_gold_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[float]]:
-    """
-    Per-spec primary: yfinance XAUUSD=X.
-    NOTE: Yahoo delisted XAUUSD=X (verified 404). Fallbacks included so the
-    pipeline remains production-ready when primary is unavailable.
-    """
     swiss = fetch_swissquote_spot_mid()
     if swiss:
         print(f"[DATA] Swissquote spot mid: {swiss:.2f}")
 
-    # Tier 1 — spec primary
     print(f"[DATA] Tier-1: yfinance {PRIMARY_YF_TICKER}")
     d15, d1h = _try_yfinance_ticker(PRIMARY_YF_TICKER)
     if _is_valid_feed(d15, d1h):
         run_circuit_breaker(d15, d1h)
         return d15, d1h, f"yfinance ({PRIMARY_YF_TICKER})", swiss
 
-    # Tier 2 — TradingView Spot XAUUSD
     d15, d1h, src = _try_tradingview()
     if _is_valid_feed(d15, d1h):
         run_circuit_breaker(d15, d1h)
         return d15, d1h, src, swiss
 
-    # Tier 3 — Dukascopy
     d15, d1h = _try_dukascopy()
     if _is_valid_feed(d15, d1h):
         run_circuit_breaker(d15, d1h)
         return d15, d1h, "Dukascopy Spot XAUUSD", swiss
 
-    # Tier 4 — yfinance proxies (PAXG / XAUT)
     for tk in PROXY_TICKERS:
         d15, d1h = _try_yfinance_ticker(tk)
         if _is_valid_feed(d15, d1h):
@@ -567,7 +558,6 @@ def fetch_spot_gold_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[fl
             run_circuit_breaker(d15, d1h)
             return d15, d1h, f"yfinance ({tk}){note}", swiss
 
-    # Tier 5 — Kraken PAXG
     d15, d1h = _try_kraken_paxg()
     if _is_valid_feed(d15, d1h):
         d15, d1h, note = _calibrate_proxy(d15, d1h, swiss)
@@ -736,7 +726,7 @@ def score_bar_confluence(row: pd.Series, z_threshold: float):
 
 
 # ==============================================================================
-# GRID SEARCH + SLIPPAGE-AWARE BACKTEST
+# GRID SEARCH + BACKTEST
 # ==============================================================================
 def run_backtest_for_params(df15: pd.DataFrame, df1h: pd.DataFrame,
                             atr_period: int, z_threshold: float) -> BacktestMetrics:
@@ -868,7 +858,7 @@ def run_grid_search(df15: pd.DataFrame, df1h: pd.DataFrame):
 
 
 # ==============================================================================
-# CHART GENERATION
+# CHART
 # ==============================================================================
 def generate_backtest_chart(best: BacktestMetrics, feed_source: str,
                             chart_path: str = CHART_PATH) -> str:
@@ -1001,7 +991,7 @@ def register_new_position(conn: sqlite3.Connection, sig: QuantitativeSignal) -> 
 
 
 # ==============================================================================
-# LIVE SIGNAL EVALUATION
+# LIVE SIGNAL
 # ==============================================================================
 def evaluate_live_signal(df15: pd.DataFrame, df1h: pd.DataFrame,
                          best: BacktestMetrics, feed_source: str,
