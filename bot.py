@@ -7,9 +7,12 @@ import json
 import lzma
 import math
 import os
+import random
 import sqlite3
+import string
 import struct
 import sys
+import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,6 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
+import websocket
 import yfinance as yf
 
 
@@ -27,8 +31,15 @@ import yfinance as yf
 # ENTERPRISE CONFIGURATION & CONSTANTS
 # ==============================================================================
 ENGINE_NAME = "APEX-QUANT-OMNI ENTERPRISE v40.0"
-PRIMARY_TICKER = "XAUUSD=X"
+TRADINGVIEW_SPOT_SYMBOLS = [
+    "OANDA:XAUUSD",
+    "FX_IDC:XAUUSD",
+    "FOREXCOM:XAUUSD",
+    "PEPPERSTONE:XAUUSD",
+]
+PRIMARY_YF_TICKER = "XAUUSD=X"
 SPOT_YFINANCE_PROXIES = ["PAXG-USD", "XAUT-USD"]
+
 DB_PATH = os.getenv("SQLITE_DB_PATH", "trading_signals.db")
 CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
 
@@ -50,9 +61,9 @@ ATR_GRID = [10, 14, 20]
 Z_THRESHOLD_GRID = [1.5, 2.0, 2.5]
 Z_LOOKBACK_WINDOW = 20
 
-DUKASCOPY_DAYS_LOOKBACK = 21
-DUKASCOPY_RECORD_FMT = ">3I2f"
-DUKASCOPY_RECORD_SIZE = struct.calcsize(DUKASCOPY_RECORD_FMT)
+DUKASCOPY_DAYS_LOOKBACK = 30
+DUKASCOPY_CANDLE_FMT = ">5if"
+DUKASCOPY_CANDLE_SIZE = struct.calcsize(DUKASCOPY_CANDLE_FMT)  # 24 bytes
 DUKASCOPY_PRICE_DIVISOR = 1000.0
 
 CIRCUIT_BREAKER_MAX_STALE_HOURS = 96.0
@@ -99,6 +110,7 @@ class QuantitativeSignal:
     rrr_tp3: float
     trailing_protocol: str
     feed_source: str
+    swissquote_spot_mid: Optional[float]
     timestamp_utc: str
     pillar_breakdown: Dict[str, Any] = field(default_factory=dict)
 
@@ -199,7 +211,6 @@ def init_sqlite_db(db_path: str = DB_PATH) -> sqlite3.Connection:
         );
         """
     )
-    # Forward-compatible migration if DB was initialized by earlier schema
     existing_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(signal_audit_log);").fetchall()
     }
@@ -246,11 +257,13 @@ def forensic_audit_log(
     to SQLite prior to webhook dispatch.
     """
     raw_payload_json = json.dumps(raw_math, default=str)
+    sq_str = f"{signal.swissquote_spot_mid:.2f}" if signal.swissquote_spot_mid else "N/A"
 
     print("\n" + "=" * 78)
     print(f"FORENSIC AUDIT REPORT | {ENGINE_NAME} | {signal.timestamp_utc}")
     print("=" * 78)
     print(f"Asset                : XAUUSD (SPOT GOLD) [{signal.feed_source}]")
+    print(f"MT5 Spot Benchmark   : Swissquote Live BBO Mid = {sq_str}")
     print(f"Signal Decision      : {signal.decision}")
     print(f"Market Regime        : {signal.market_regime}")
     print(f"Confluence Score     : {signal.confluence_score:.2f} / 100.00")
@@ -315,7 +328,7 @@ def forensic_audit_log(
 
 
 # ==============================================================================
-# MULTI-TIER SPOT GOLD DATA PIPELINE + MULTI-INDEX CLEANING + CIRCUIT BREAKER
+# MT5-GRADE SPOT XAUUSD DATA PIPELINE + CIRCUIT BREAKER
 # ==============================================================================
 def normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -373,6 +386,243 @@ def clean_yfinance_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return normalize_ohlcv_dataframe(df)
 
 
+def fetch_swissquote_spot_mid() -> Optional[float]:
+    """
+    Pulls real-time institutional Spot XAU/USD Bid/Ask from Swissquote's free
+    public feed as an MT5-aligned spot price benchmark.
+    """
+    url = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            return None
+        for node in data:
+            profiles = node.get("spreadProfilePrices", [])
+            for prof in profiles:
+                bid = prof.get("bid")
+                ask = prof.get("ask")
+                if bid and ask and float(bid) > 0 and float(ask) > 0:
+                    return (float(bid) + float(ask)) * 0.5
+        return None
+    except Exception:
+        return None
+
+
+def _tv_send(ws: websocket.WebSocket, func: str, args: List[Any]) -> None:
+    payload = json.dumps({"m": func, "p": args}, separators=(",", ":"))
+    ws.send(f"~m~{len(payload)}~m~{payload}")
+
+
+def _tv_parse_frames(raw_msg: str) -> List[str]:
+    frames: List[str] = []
+    idx = 0
+    total = len(raw_msg)
+    while idx < total:
+        if not raw_msg.startswith("~m~", idx):
+            break
+        sep = raw_msg.find("~m~", idx + 3)
+        if sep == -1:
+            break
+        try:
+            frame_len = int(raw_msg[idx + 3 : sep])
+        except ValueError:
+            break
+        start = sep + 3
+        end = start + frame_len
+        frames.append(raw_msg[start:end])
+        idx = end
+    return frames
+
+
+def _fetch_tradingview_series(symbol: str, resolution: str, n_bars: int) -> pd.DataFrame:
+    """
+    Connects anonymously to TradingView's public chart WebSocket to retrieve
+    real-time & historical Spot XAUUSD candles (OANDA/FX_IDC/FOREXCOM).
+    """
+    ws_url = "wss://data.tradingview.com/socket.io/websocket?from=chart%2F"
+    chart_session = "cs_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+    bars_map: Dict[float, Tuple[float, float, float, float, float]] = {}
+
+    ws = websocket.create_connection(
+        ws_url,
+        timeout=15,
+        header={
+            "Origin": "https://data.tradingview.com",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        },
+    )
+    try:
+        _tv_send(ws, "set_auth_token", ["unauthorized_user_token"])
+        _tv_send(ws, "chart_create_session", [chart_session, ""])
+        _tv_send(ws, "switch_timezone", [chart_session, "Etc/UTC"])
+        sym_cfg = json.dumps({"symbol": symbol, "adjustment": "splits"}, separators=(",", ":"))
+        _tv_send(ws, "resolve_symbol", [chart_session, "sds_sym_1", f"={sym_cfg}"])
+        _tv_send(ws, "create_series", [chart_session, "sds_1", "s1", "sds_sym_1", resolution, n_bars])
+
+        deadline = time.monotonic() + 18.0
+        while time.monotonic() < deadline:
+            raw_msg = ws.recv()
+            if not raw_msg:
+                continue
+            for frame in _tv_parse_frames(raw_msg):
+                if frame.startswith("~h~"):
+                    ws.send(f"~m~{len(frame)}~m~{frame}")
+                    continue
+                try:
+                    pkt = json.loads(frame)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(pkt, dict):
+                    continue
+
+                method = pkt.get("m")
+                params = pkt.get("p", [])
+
+                if method in ("symbol_error", "series_error"):
+                    return pd.DataFrame()
+
+                if method in ("timescale_update", "du"):
+                    for item in params:
+                        if not isinstance(item, dict):
+                            continue
+                        for val in item.values():
+                            if not isinstance(val, dict):
+                                continue
+                            for bar in val.get("s", []):
+                                vec = bar.get("v", [])
+                                if len(vec) >= 5:
+                                    ts_val = float(vec[0])
+                                    vol_val = float(vec[5]) if len(vec) >= 6 and vec[5] is not None else 0.0
+                                    bars_map[ts_val] = (
+                                        float(vec[1]),
+                                        float(vec[2]),
+                                        float(vec[3]),
+                                        float(vec[4]),
+                                        vol_val,
+                                    )
+
+                if method == "series_completed" and len(bars_map) >= 60:
+                    break
+            else:
+                continue
+            break
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+    if not bars_map:
+        return pd.DataFrame()
+
+    rows = [
+        {
+            "Timestamp": pd.to_datetime(ts_sec, unit="s", utc=True),
+            "Open": vals[0],
+            "High": vals[1],
+            "Low": vals[2],
+            "Close": vals[3],
+            "Volume": vals[4],
+        }
+        for ts_sec, vals in sorted(bars_map.items())
+    ]
+    df = pd.DataFrame(rows).set_index("Timestamp")
+    return normalize_ohlcv_dataframe(df)
+
+
+def _try_tradingview_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Queries TradingView public Spot FX XAUUSD feeds (OANDA/FX_IDC/FOREXCOM)."""
+    for symbol in TRADINGVIEW_SPOT_SYMBOLS:
+        try:
+            print(f"[DATA] Querying TradingView Spot XAUUSD ({symbol})...")
+            df_15m = _fetch_tradingview_series(symbol, "15", 1500)
+            df_1h = _fetch_tradingview_series(symbol, "60", 1000)
+            if _is_valid_feed(df_15m, df_1h):
+                return df_15m, df_1h, f"TradingView Spot ({symbol})"
+        except Exception as exc:
+            print(f"[DATA] TradingView {symbol} attempt failed: {exc}")
+    return pd.DataFrame(), pd.DataFrame(), ""
+
+
+def _fetch_dukascopy_day_candles(
+    session: requests.Session, day_dt: dt.datetime
+) -> List[Tuple[pd.Timestamp, float, float, float, float, float]]:
+    """Downloads and decodes a single day's 1-minute BID candle .bi5 file for XAUUSD."""
+    url = (
+        f"https://datafeed.dukascopy.com/datafeed/XAUUSD/"
+        f"{day_dt.year}/{day_dt.month - 1:02d}/{day_dt.day:02d}/BID_candles_min_1.bi5"
+    )
+    try:
+        resp = session.get(url, timeout=10)
+        if resp.status_code != 200 or not resp.content:
+            return []
+        raw = lzma.decompress(resp.content)
+        rows: List[Tuple[pd.Timestamp, float, float, float, float, float]] = []
+        base_ts = pd.Timestamp(day_dt.year, day_dt.month, day_dt.day, tz="UTC")
+        usable = len(raw) - (len(raw) % DUKASCOPY_CANDLE_SIZE)
+        for offset in range(0, usable, DUKASCOPY_CANDLE_SIZE):
+            sec_off, o_int, c_int, l_int, h_int, vol = struct.unpack(
+                DUKASCOPY_CANDLE_FMT, raw[offset : offset + DUKASCOPY_CANDLE_SIZE]
+            )
+            o_px = o_int / DUKASCOPY_PRICE_DIVISOR
+            h_px = h_int / DUKASCOPY_PRICE_DIVISOR
+            l_px = l_int / DUKASCOPY_PRICE_DIVISOR
+            c_px = c_int / DUKASCOPY_PRICE_DIVISOR
+            if c_px <= 0.0:
+                continue
+            ts = base_ts + pd.Timedelta(seconds=int(sec_off))
+            rows.append((ts, o_px, h_px, l_px, c_px, float(vol)))
+        return rows
+    except Exception:
+        return []
+
+
+def _try_dukascopy_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Pulls institutional Spot Gold (XAUUSD) 1-minute BID candles from Dukascopy
+    over the last 30 days and resamples to 15m and 1h OHLCV.
+    """
+    print("[DATA] Querying Dukascopy institutional Spot XAUUSD (1m daily .bi5)...")
+    today_utc = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    day_list = [today_utc - dt.timedelta(days=d) for d in range(DUKASCOPY_DAYS_LOOKBACK, -1, -1)]
+
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    all_m1: List[Tuple[pd.Timestamp, float, float, float, float, float]] = []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+            for chunk in pool.map(lambda d: _fetch_dukascopy_day_candles(session, d), day_list):
+                if chunk:
+                    all_m1.extend(chunk)
+    finally:
+        session.close()
+
+    if len(all_m1) < 1800:
+        return pd.DataFrame(), pd.DataFrame()
+
+    m1_df = pd.DataFrame(all_m1, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    m1_df["Timestamp"] = pd.to_datetime(m1_df["Timestamp"], utc=True)
+    m1_df = m1_df.set_index("Timestamp").sort_index()
+
+    agg_spec = {
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }
+
+    df_15m_raw = m1_df.resample("15min").agg(agg_spec).dropna(subset=["Open", "Close"])
+    df_1h_raw = m1_df.resample("1h").agg(agg_spec).dropna(subset=["Open", "Close"])
+
+    return normalize_ohlcv_dataframe(df_15m_raw), normalize_ohlcv_dataframe(df_1h_raw)
+
+
 def _try_yfinance_ticker(ticker: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Attempts to download 15m and 1h OHLCV cleanly via yfinance."""
     try:
@@ -398,92 +648,13 @@ def _try_yfinance_ticker(ticker: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         return pd.DataFrame(), pd.DataFrame()
 
 
-def _fetch_dukascopy_hour(
-    session: requests.Session, hour_dt: dt.datetime
-) -> List[Tuple[pd.Timestamp, float, float]]:
-    """Downloads and decodes a single Dukascopy XAUUSD hourly .bi5 LZMA tick file."""
-    url = (
-        f"https://datafeed.dukascopy.com/datafeed/XAUUSD/"
-        f"{hour_dt.year}/{hour_dt.month - 1:02d}/{hour_dt.day:02d}/{hour_dt.hour:02d}h_ticks.bi5"
-    )
-    try:
-        resp = session.get(url, timeout=8)
-        if resp.status_code != 200 or not resp.content:
-            return []
-        raw = lzma.decompress(resp.content)
-        rows: List[Tuple[pd.Timestamp, float, float]] = []
-        base_ts = pd.Timestamp(hour_dt)
-        for offset in range(0, len(raw) - (len(raw) % DUKASCOPY_RECORD_SIZE), DUKASCOPY_RECORD_SIZE):
-            ms_offset, raw_ask, raw_bid, ask_vol, bid_vol = struct.unpack(
-                DUKASCOPY_RECORD_FMT, raw[offset : offset + DUKASCOPY_RECORD_SIZE]
-            )
-            mid_px = ((raw_ask + raw_bid) * 0.5) / DUKASCOPY_PRICE_DIVISOR
-            if mid_px <= 0.0:
-                continue
-            tick_ts = base_ts + pd.Timedelta(milliseconds=int(ms_offset))
-            vol = float(ask_vol + bid_vol)
-            rows.append((tick_ts, mid_px, vol))
-        return rows
-    except Exception:
-        return []
-
-
-def _try_dukascopy_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Pulls institutional Spot Gold (XAUUSD) tick data from Dukascopy's public
-    registration-free feed and resamples to 15m and 1h OHLCV.
-    """
-    print("[DATA] Querying Dukascopy institutional Spot Gold (XAUUSD) feed...")
-    now_utc = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
-    hours_back = DUKASCOPY_DAYS_LOOKBACK * 24
-    hour_list = [now_utc - dt.timedelta(hours=h) for h in range(1, hours_back + 1)]
-
-    session = requests.Session()
-    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
-    session.mount("https://", adapter)
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
-
-    all_ticks: List[Tuple[pd.Timestamp, float, float]] = []
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-            for chunk in pool.map(lambda h: _fetch_dukascopy_hour(session, h), hour_list):
-                if chunk:
-                    all_ticks.extend(chunk)
-    finally:
-        session.close()
-
-    if len(all_ticks) < 500:
-        return pd.DataFrame(), pd.DataFrame()
-
-    tick_df = pd.DataFrame(all_ticks, columns=["Timestamp", "Price", "Volume"])
-    tick_df["Timestamp"] = pd.to_datetime(tick_df["Timestamp"], utc=True)
-    tick_df = tick_df.set_index("Timestamp").sort_index()
-
-    agg_spec = {"Price": ["first", "max", "min", "last"], "Volume": "sum"}
-
-    df_15m_raw = tick_df.resample("15min").agg(agg_spec).dropna(subset=[("Price", "first")])
-    df_15m_raw.columns = ["Open", "High", "Low", "Close", "Volume"]
-
-    df_1h_raw = tick_df.resample("1h").agg(agg_spec).dropna(subset=[("Price", "first")])
-    df_1h_raw.columns = ["Open", "High", "Low", "Close", "Volume"]
-
-    return normalize_ohlcv_dataframe(df_15m_raw), normalize_ohlcv_dataframe(df_1h_raw)
-
-
 def _try_kraken_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Pulls live 15m & 1h physical-gold-backed PAXGUSD OHLCV from Kraken's
-    public unauthenticated REST API.
-    """
-    print("[DATA] Querying Kraken public Spot Gold proxy (PAXGUSD) feed...")
+    """Pulls live 15m & 1h PAXGUSD OHLCV from Kraken's public unauthenticated API."""
+    print("[DATA] Querying Kraken public Spot Gold proxy (PAXGUSD)...")
     url = "https://api.kraken.com/0/public/OHLC"
 
     def _pull_interval(interval_min: int) -> pd.DataFrame:
-        resp = requests.get(
-            url,
-            params={"pair": "PAXGUSD", "interval": interval_min},
-            timeout=15,
-        )
+        resp = requests.get(url, params={"pair": "PAXGUSD", "interval": interval_min}, timeout=15)
         resp.raise_for_status()
         payload = resp.json()
         if payload.get("error"):
@@ -508,6 +679,29 @@ def _try_kraken_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame]:
         return pd.DataFrame(), pd.DataFrame()
 
 
+def _calibrate_proxy_to_spot(
+    df_15m: pd.DataFrame, df_1h: pd.DataFrame, swissquote_mid: Optional[float]
+) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+    """
+    If fallback uses a tokenized proxy (PAXG/XAUT), removes any token premium/discount
+    relative to Swissquote's live institutional Spot XAU/USD price.
+    """
+    if swissquote_mid is None or df_15m.empty:
+        return df_15m, df_1h, ""
+    proxy_close = float(df_15m["Close"].iloc[-1])
+    basis_delta = swissquote_mid - proxy_close
+    if abs(basis_delta) <= 0.05:
+        return df_15m, df_1h, ""
+
+    df_15m_adj = df_15m.copy()
+    df_1h_adj = df_1h.copy()
+    for col in ["Open", "High", "Low", "Close"]:
+        df_15m_adj[col] = df_15m_adj[col] + basis_delta
+        df_1h_adj[col] = df_1h_adj[col] + basis_delta
+    note = f" + Basis Calibrated {basis_delta:+.2f} to Swissquote Spot"
+    return df_15m_adj, df_1h_adj, note
+
+
 def _is_valid_feed(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> bool:
     if df_15m.empty or df_1h.empty:
         return False
@@ -518,44 +712,52 @@ def _is_valid_feed(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> bool:
     return staleness_h <= CIRCUIT_BREAKER_MAX_STALE_HOURS
 
 
-def fetch_spot_gold_data() -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+def fetch_spot_gold_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[float]]:
     """
-    Executes a 100% free, registration-free Spot Gold data waterfall
-    (strictly avoiding futures GC=F):
-      1. yfinance XAUUSD=X
-      2. Dukascopy Institutional Spot XAUUSD (.bi5 ticks)
-      3. yfinance Physical-Gold Spot Proxy (PAXG-USD / XAUT-USD)
-      4. Kraken Public Spot Proxy (PAXGUSD)
+    100% Free, Registration-Free Spot Gold Data Pipeline (Strictly avoiding GC=F):
+      1. TradingView Public Spot FX XAUUSD (OANDA / FX_IDC / FOREXCOM / PEPPERSTONE)
+      2. Dukascopy Institutional Spot XAUUSD (1m BID .bi5 candles)
+      3. yfinance XAUUSD=X (if restored regionally)
+      4. Emergency Spot-Calibrated Proxy (PAXG-USD / XAUT-USD / Kraken PAXGUSD)
     """
-    # Tier 1: yfinance XAUUSD=X
-    df_15m, df_1h = _try_yfinance_ticker(PRIMARY_TICKER)
+    swissquote_mid = fetch_swissquote_spot_mid()
+    if swissquote_mid is not None:
+        print(f"[DATA] Swissquote Live MT5-Grade Spot XAU/USD Mid: {swissquote_mid:.2f}")
+
+    # Tier 1: TradingView Spot XAUUSD (matches MT5 Spot directly)
+    df_15m, df_1h, tv_source = _try_tradingview_spot_gold()
     if _is_valid_feed(df_15m, df_1h):
         run_circuit_breaker(df_15m, df_1h)
-        return df_15m, df_1h, f"yfinance ({PRIMARY_TICKER})"
-
-    print(f"[DATA] Primary ticker {PRIMARY_TICKER} unavailable; engaging Spot Gold fallback waterfall...")
+        return df_15m, df_1h, tv_source, swissquote_mid
 
     # Tier 2: Dukascopy Institutional Spot XAUUSD
     df_15m, df_1h = _try_dukascopy_spot_gold()
     if _is_valid_feed(df_15m, df_1h):
         run_circuit_breaker(df_15m, df_1h)
-        return df_15m, df_1h, "Dukascopy Spot XAUUSD"
+        return df_15m, df_1h, "Dukascopy Spot XAUUSD", swissquote_mid
 
-    # Tier 3: yfinance Physical-Gold-Backed Spot Tokens (No Futures GC=F)
+    # Tier 3: yfinance XAUUSD=X
+    df_15m, df_1h = _try_yfinance_ticker(PRIMARY_YF_TICKER)
+    if _is_valid_feed(df_15m, df_1h):
+        run_circuit_breaker(df_15m, df_1h)
+        return df_15m, df_1h, f"yfinance ({PRIMARY_YF_TICKER})", swissquote_mid
+
+    # Tier 4: Emergency Spot-Calibrated Proxies (No Futures GC=F)
     for proxy_ticker in SPOT_YFINANCE_PROXIES:
         df_15m, df_1h = _try_yfinance_ticker(proxy_ticker)
         if _is_valid_feed(df_15m, df_1h):
+            df_15m, df_1h, cal_note = _calibrate_proxy_to_spot(df_15m, df_1h, swissquote_mid)
             run_circuit_breaker(df_15m, df_1h)
-            return df_15m, df_1h, f"yfinance Spot Gold ({proxy_ticker})"
+            return df_15m, df_1h, f"yfinance ({proxy_ticker}){cal_note}", swissquote_mid
 
-    # Tier 4: Kraken Public REST API PAXGUSD
     df_15m, df_1h = _try_kraken_spot_gold()
     if _is_valid_feed(df_15m, df_1h):
+        df_15m, df_1h, cal_note = _calibrate_proxy_to_spot(df_15m, df_1h, swissquote_mid)
         run_circuit_breaker(df_15m, df_1h)
-        return df_15m, df_1h, "Kraken Public Spot (PAXGUSD)"
+        return df_15m, df_1h, f"Kraken (PAXGUSD){cal_note}", swissquote_mid
 
     raise CircuitBreakerTripped(
-        "All registration-free Spot Gold feeds failed (XAUUSD=X, Dukascopy XAUUSD, PAXG-USD, XAUT-USD, Kraken PAXGUSD)."
+        "All registration-free Spot Gold feeds failed (TradingView XAUUSD, Dukascopy XAUUSD, yfinance, Kraken)."
     )
 
 
@@ -1355,6 +1557,7 @@ def evaluate_live_signal(
     df_1h: pd.DataFrame,
     best_metrics: BacktestMetrics,
     feed_source: str,
+    swissquote_mid: Optional[float],
 ) -> Tuple[QuantitativeSignal, Dict[str, Any]]:
     """Evaluates the latest 15m candle using optimal Grid Search parameters."""
     enriched = enrich_features(
@@ -1421,12 +1624,14 @@ def evaluate_live_signal(
         rrr_tp3=rrr_tp3,
         trailing_protocol="Active @ TP1 Breakeven",
         feed_source=feed_source,
+        swissquote_spot_mid=swissquote_mid,
         timestamp_utc=ts_utc,
         pillar_breakdown=breakdown,
     )
 
     raw_math = {
         "feed_source": feed_source,
+        "swissquote_spot_mid": round(swissquote_mid, 4) if swissquote_mid else None,
         "latest_bar_time": str(enriched.index[-1]),
         "open": round(float(eval_row["Open"]), 4),
         "high": round(float(eval_row["High"]), 4),
@@ -1590,11 +1795,11 @@ def dispatch_dual_channel_webhooks(
 def main() -> int:
     conn: Optional[sqlite3.Connection] = None
     try:
-        print(f"[BOOT] Initializing {ENGINE_NAME} (Spot Gold Pipeline)...")
+        print(f"[BOOT] Initializing {ENGINE_NAME} (MT5-Aligned Spot Gold Pipeline)...")
         conn = init_sqlite_db(DB_PATH)
 
         # 1. Fetch & Clean Spot Gold Feed + Circuit Breaker
-        df_15m, df_1h, feed_source = fetch_spot_gold_data()
+        df_15m, df_1h, feed_source, swissquote_mid = fetch_spot_gold_data()
         print(
             f"[DATA] Feed='{feed_source}' | Loaded {len(df_15m)}x 15m bars & {len(df_1h)}x 1h bars | "
             f"Latest Spot Close: {float(df_15m['Close'].iloc[-1]):.2f}"
@@ -1608,7 +1813,9 @@ def main() -> int:
         print(f"[CHART] {chart_status} -> {CHART_PATH}")
 
         # 4. Live 5-Pillar Signal Evaluation
-        signal, raw_math = evaluate_live_signal(df_15m, df_1h, best_metrics, feed_source)
+        signal, raw_math = evaluate_live_signal(
+            df_15m, df_1h, best_metrics, feed_source, swissquote_mid
+        )
 
         # 5. Auto-Trailing Stop Management for Existing Open Positions
         latest_atr_series = compute_atr(df_15m, best_metrics.atr_period)
