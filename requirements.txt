@@ -3,3 +3,4 @@ numpy>=1.26.4
 requests>=2.31.0
 yfinance>=0.2.40
 matplotlib>=3.8.4
+websocket-client>=1.7.0
