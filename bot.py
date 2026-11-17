@@ -53,9 +53,12 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 EPSILON = 1e-8
 SPREAD_DOLLARS = 0.30
 SLIPPAGE_DOLLARS = 0.15
-XAU_CONTRACT_MULTIPLIER = 100.0  # 1.00 Standard Lot = 100 oz -> $1 move = $100
+XAU_CONTRACT_MULTIPLIER = 100.0
 MIN_RRR_TARGET = 3.0
 CONFLUENCE_THRESHOLD = 65.0
+
+# ─── TRAILING ATR MULTIPLIER (dari 0.75 → 1.50) ───
+TRAILING_ATR_MULT = 1.50
 
 ATR_GRID = [10, 14, 20]
 Z_THRESHOLD_GRID = [1.5, 2.0, 2.5]
@@ -63,7 +66,7 @@ Z_LOOKBACK_WINDOW = 20
 
 DUKASCOPY_DAYS_LOOKBACK = 30
 DUKASCOPY_CANDLE_FMT = ">5if"
-DUKASCOPY_CANDLE_SIZE = struct.calcsize(DUKASCOPY_CANDLE_FMT)  # 24 bytes
+DUKASCOPY_CANDLE_SIZE = struct.calcsize(DUKASCOPY_CANDLE_FMT)
 DUKASCOPY_PRICE_DIVISOR = 1000.0
 
 CIRCUIT_BREAKER_MAX_STALE_HOURS = 96.0
@@ -92,7 +95,7 @@ class BacktestMetrics:
 
 @dataclass
 class QuantitativeSignal:
-    decision: str  # "VERIFIED BUY", "VERIFIED SELL", or "NO SIGNAL"
+    decision: str
     entry_price: float
     stop_loss: float
     tp1: float
@@ -252,10 +255,7 @@ def forensic_audit_log(
     best_metrics: BacktestMetrics,
     raw_math: Dict[str, Any],
 ) -> str:
-    """
-    Outputs raw mathematical diagnostics to stdout AND persists every evaluation
-    to SQLite prior to webhook dispatch.
-    """
+    """Outputs raw mathematical diagnostics to stdout AND persists to SQLite."""
     raw_payload_json = json.dumps(raw_math, default=str)
     sq_str = f"{signal.swissquote_spot_mid:.2f}" if signal.swissquote_spot_mid else "N/A"
 
@@ -272,7 +272,7 @@ def forensic_audit_log(
     print(f"TP1 (1.5R)           : {signal.tp1:.2f}")
     print(f"TP2 (2.5R)           : {signal.tp2:.2f}")
     print(f"TP3 (4.0R)           : {signal.tp3:.2f} (RRR 1:{signal.rrr_tp3:.2f})")
-    print(f"Trailing Protocol    : {signal.trailing_protocol}")
+    print(f"Trailing Protocol    : {signal.trailing_protocol} (Step {TRAILING_ATR_MULT:.2f}×ATR)")
     print(f"Optimal Grid Params  : ATR={best_metrics.atr_period} | Z-Thresh={best_metrics.z_threshold:.1f}")
     print(f"Backtest Stats       : Trades={best_metrics.total_trades} | WR={best_metrics.win_rate:.2f}% | PF={best_metrics.profit_factor:.2f} | MaxDD={best_metrics.max_drawdown:.2f}%")
     print(f"Lot & Risk (1%)      : {signal.recommended_lot:.2f} Lots | ${signal.risk_usd:.2f}")
@@ -331,10 +331,7 @@ def forensic_audit_log(
 # MT5-GRADE SPOT XAUUSD DATA PIPELINE + CIRCUIT BREAKER
 # ==============================================================================
 def normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Standardizes OHLCV columns, enforces UTC nanosecond DatetimeIndex,
-    deduplicates timestamps, and enforces candle high/low integrity.
-    """
+    """Standardizes OHLCV columns, enforces UTC nanosecond DatetimeIndex."""
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -375,9 +372,7 @@ def normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def clean_yfinance_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Flattens yfinance MultiIndex columns and applies strict OHLCV sanitization.
-    """
+    """Flattens yfinance MultiIndex columns and applies strict OHLCV sanitization."""
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
@@ -387,10 +382,7 @@ def clean_yfinance_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_swissquote_spot_mid() -> Optional[float]:
-    """
-    Pulls real-time institutional Spot XAU/USD Bid/Ask from Swissquote's free
-    public feed as an MT5-aligned spot price benchmark.
-    """
+    """Pulls real-time institutional Spot XAU/USD Bid/Ask from Swissquote."""
     url = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
     try:
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
@@ -437,10 +429,7 @@ def _tv_parse_frames(raw_msg: str) -> List[str]:
 
 
 def _fetch_tradingview_series(symbol: str, resolution: str, n_bars: int) -> pd.DataFrame:
-    """
-    Connects anonymously to TradingView's public chart WebSocket to retrieve
-    real-time & historical Spot XAUUSD candles (OANDA/FX_IDC/FOREXCOM).
-    """
+    """Connects anonymously to TradingView's public chart WebSocket."""
     ws_url = "wss://data.tradingview.com/socket.io/websocket?from=chart%2F"
     chart_session = "cs_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
     bars_map: Dict[float, Tuple[float, float, float, float, float]] = {}
@@ -533,7 +522,7 @@ def _fetch_tradingview_series(symbol: str, resolution: str, n_bars: int) -> pd.D
 
 
 def _try_tradingview_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame, str]:
-    """Queries TradingView public Spot FX XAUUSD feeds (OANDA/FX_IDC/FOREXCOM)."""
+    """Queries TradingView public Spot FX XAUUSD feeds."""
     for symbol in TRADINGVIEW_SPOT_SYMBOLS:
         try:
             print(f"[DATA] Querying TradingView Spot XAUUSD ({symbol})...")
@@ -549,7 +538,7 @@ def _try_tradingview_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame, str]:
 def _fetch_dukascopy_day_candles(
     session: requests.Session, day_dt: dt.datetime
 ) -> List[Tuple[pd.Timestamp, float, float, float, float, float]]:
-    """Downloads and decodes a single day's 1-minute BID candle .bi5 file for XAUUSD."""
+    """Downloads and decodes a single day's 1-minute BID candle .bi5 file."""
     url = (
         f"https://datafeed.dukascopy.com/datafeed/XAUUSD/"
         f"{day_dt.year}/{day_dt.month - 1:02d}/{day_dt.day:02d}/BID_candles_min_1.bi5"
@@ -580,10 +569,7 @@ def _fetch_dukascopy_day_candles(
 
 
 def _try_dukascopy_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Pulls institutional Spot Gold (XAUUSD) 1-minute BID candles from Dukascopy
-    over the last 30 days and resamples to 15m and 1h OHLCV.
-    """
+    """Pulls institutional Spot Gold from Dukascopy over last 30 days."""
     print("[DATA] Querying Dukascopy institutional Spot XAUUSD (1m daily .bi5)...")
     today_utc = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     day_list = [today_utc - dt.timedelta(days=d) for d in range(DUKASCOPY_DAYS_LOOKBACK, -1, -1)]
@@ -649,7 +635,7 @@ def _try_yfinance_ticker(ticker: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _try_kraken_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Pulls live 15m & 1h PAXGUSD OHLCV from Kraken's public unauthenticated API."""
+    """Pulls live 15m & 1h PAXGUSD OHLCV from Kraken's public API."""
     print("[DATA] Querying Kraken public Spot Gold proxy (PAXGUSD)...")
     url = "https://api.kraken.com/0/public/OHLC"
 
@@ -682,10 +668,7 @@ def _try_kraken_spot_gold() -> Tuple[pd.DataFrame, pd.DataFrame]:
 def _calibrate_proxy_to_spot(
     df_15m: pd.DataFrame, df_1h: pd.DataFrame, swissquote_mid: Optional[float]
 ) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
-    """
-    If fallback uses a tokenized proxy (PAXG/XAUT), removes any token premium/discount
-    relative to Swissquote's live institutional Spot XAU/USD price.
-    """
+    """Removes token premium/discount relative to Swissquote Spot."""
     if swissquote_mid is None or df_15m.empty:
         return df_15m, df_1h, ""
     proxy_close = float(df_15m["Close"].iloc[-1])
@@ -713,24 +696,18 @@ def _is_valid_feed(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> bool:
 
 
 def fetch_spot_gold_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[float]]:
-    """
-    100% Free, Registration-Free Spot Gold Data Pipeline (Strictly avoiding GC=F):
-      1. TradingView Public Spot FX XAUUSD (OANDA / FX_IDC / FOREXCOM / PEPPERSTONE)
-      2. Dukascopy Institutional Spot XAUUSD (1m BID .bi5 candles)
-      3. yfinance XAUUSD=X (if restored regionally)
-      4. Emergency Spot-Calibrated Proxy (PAXG-USD / XAUT-USD / Kraken PAXGUSD)
-    """
+    """Multi-tier Spot Gold data pipeline."""
     swissquote_mid = fetch_swissquote_spot_mid()
     if swissquote_mid is not None:
         print(f"[DATA] Swissquote Live MT5-Grade Spot XAU/USD Mid: {swissquote_mid:.2f}")
 
-    # Tier 1: TradingView Spot XAUUSD (matches MT5 Spot directly)
+    # Tier 1: TradingView
     df_15m, df_1h, tv_source = _try_tradingview_spot_gold()
     if _is_valid_feed(df_15m, df_1h):
         run_circuit_breaker(df_15m, df_1h)
         return df_15m, df_1h, tv_source, swissquote_mid
 
-    # Tier 2: Dukascopy Institutional Spot XAUUSD
+    # Tier 2: Dukascopy
     df_15m, df_1h = _try_dukascopy_spot_gold()
     if _is_valid_feed(df_15m, df_1h):
         run_circuit_breaker(df_15m, df_1h)
@@ -742,7 +719,7 @@ def fetch_spot_gold_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[fl
         run_circuit_breaker(df_15m, df_1h)
         return df_15m, df_1h, f"yfinance ({PRIMARY_YF_TICKER})", swissquote_mid
 
-    # Tier 4: Emergency Spot-Calibrated Proxies (No Futures GC=F)
+    # Tier 4: yfinance proxies
     for proxy_ticker in SPOT_YFINANCE_PROXIES:
         df_15m, df_1h = _try_yfinance_ticker(proxy_ticker)
         if _is_valid_feed(df_15m, df_1h):
@@ -750,6 +727,7 @@ def fetch_spot_gold_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[fl
             run_circuit_breaker(df_15m, df_1h)
             return df_15m, df_1h, f"yfinance ({proxy_ticker}){cal_note}", swissquote_mid
 
+    # Tier 5: Kraken
     df_15m, df_1h = _try_kraken_spot_gold()
     if _is_valid_feed(df_15m, df_1h):
         df_15m, df_1h, cal_note = _calibrate_proxy_to_spot(df_15m, df_1h, swissquote_mid)
@@ -837,10 +815,7 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def compute_smc_structure(df: pd.DataFrame, swing_lookback: int = 3) -> pd.DataFrame:
-    """
-    Pillar I (SMC): Causal Swing High/Low detection, Break of Structure (BOS),
-    and Change of Character (ChoCh) without future look-ahead leakage.
-    """
+    """Pillar I (SMC): Causal Swing High/Low detection, BOS, ChoCh."""
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
@@ -909,10 +884,7 @@ def compute_smc_structure(df: pd.DataFrame, swing_lookback: int = 3) -> pd.DataF
 
 
 def compute_order_flow_features(df: pd.DataFrame, atr: pd.Series) -> pd.DataFrame:
-    """
-    Pillar II (Order Flow): Volume-weighted body-to-wick displacement ratios.
-    Falls back cleanly to range-activity weighting if spot Volume is 0.
-    """
+    """Pillar II (Order Flow): Volume-weighted body-to-wick displacement ratios."""
     candle_range = (df["High"] - df["Low"]).abs() + EPSILON
     body = df["Close"] - df["Open"]
     abs_body = body.abs()
@@ -952,7 +924,6 @@ def enrich_features(
     """Builds the unified 5-pillar feature matrix aligned across 1H and 15M."""
     df = df_15m.copy()
 
-    # Pillar V: ATR & Market Regime Governor
     df["ATR"] = compute_atr(df, atr_period)
     df["ADX"] = compute_adx(df, 14)
     atr_pct_rank = df["ATR"].rolling(96, min_periods=20).rank(pct=True).fillna(0.5)
@@ -963,20 +934,16 @@ def enrich_features(
     df["Efficiency_Ratio"] = efficiency_ratio
     df["Regime_Trending"] = (df["ADX"] >= 18.0) & (atr_pct_rank >= 0.20) & (efficiency_ratio >= 0.22)
 
-    # Pillar I: SMC
     smc = compute_smc_structure(df, swing_lookback=3)
     df = pd.concat([df, smc], axis=1)
 
-    # Pillar II: Order Flow
     flow = compute_order_flow_features(df, df["ATR"])
     df = pd.concat([df, flow], axis=1)
 
-    # Pillar III: Z-Score Mean Reversion (Division-by-Zero Protected)
     rolling_mean = df["Close"].rolling(window=z_window, min_periods=z_window).mean()
     rolling_std = df["Close"].rolling(window=z_window, min_periods=z_window).std(ddof=0)
     df["Z_Score"] = ((df["Close"] - rolling_mean) / (rolling_std + EPSILON)).fillna(0.0)
 
-    # Pillar IV: Multi-Timeframe 1H Fractal Harmony (strict backward merge_asof)
     htf = df_1h.copy()
     htf["HTF_EMA20"] = htf["Close"].ewm(span=20, adjust=False).mean()
     htf["HTF_EMA50"] = htf["Close"].ewm(span=50, adjust=False).mean()
@@ -1013,10 +980,7 @@ def enrich_features(
 
 
 def score_bar_confluence(row: pd.Series, z_threshold: float) -> Tuple[str, float, Dict[str, float]]:
-    """
-    Scores a single bar across all 5 pillars (0..100) and emits directional intent.
-    Harmonizes macro trend (1H) + SMC structure with Z-Score pullback & order flow.
-    """
+    """Scores a single bar across all 5 pillars (0..100) and emits directional intent."""
     htf_trend = int(row["HTF_Trend"])
     smc_bias = int(row["smc_bias"])
     z_score = float(row["Z_Score"])
@@ -1098,10 +1062,7 @@ def run_backtest_for_params(
     atr_period: int,
     z_threshold: float,
 ) -> BacktestMetrics:
-    """
-    Executes a realistic spread + slippage-aware simulation including TP1
-    breakeven transition and fractional-ATR trailing stop exits.
-    """
+    """Executes realistic spread + slippage-aware simulation with trailing stops."""
     df = enrich_features(df_15m, df_1h, atr_period=atr_period, z_window=Z_LOOKBACK_WINDOW)
 
     opens = df["Open"].values
@@ -1168,7 +1129,7 @@ def run_backtest_for_params(
                         tp1_hit = True
                         sl_px = max(sl_px, entry_px)
                     if tp1_hit:
-                        trailing_candidate = best_fav - (0.75 * pos_atr)
+                        trailing_candidate = best_fav - (TRAILING_ATR_MULT * pos_atr)
                         sl_px = max(sl_px, trailing_candidate)
             else:
                 best_fav = min(best_fav, l)
@@ -1191,7 +1152,7 @@ def run_backtest_for_params(
                         tp1_hit = True
                         sl_px = min(sl_px, entry_px)
                     if tp1_hit:
-                        trailing_candidate = best_fav + (0.75 * pos_atr)
+                        trailing_candidate = best_fav + (TRAILING_ATR_MULT * pos_atr)
                         sl_px = min(sl_px, trailing_candidate)
 
             peak_equity = max(peak_equity, equity)
@@ -1297,10 +1258,7 @@ def run_backtest_for_params(
 def run_grid_search_optimization(
     df_15m: pd.DataFrame, df_1h: pd.DataFrame
 ) -> Tuple[BacktestMetrics, List[BacktestMetrics]]:
-    """
-    Searches predefined ATR Period & Z-Score Threshold grid to select the
-    highest Profit Factor configuration (requiring statistical trade support).
-    """
+    """Grid search across ATR & Z-Score threshold; selects highest Profit Factor."""
     candidates: List[BacktestMetrics] = []
     for atr_p in ATR_GRID:
         for z_th in Z_THRESHOLD_GRID:
@@ -1331,10 +1289,7 @@ def run_grid_search_optimization(
 def generate_backtest_chart(
     best_metrics: BacktestMetrics, feed_source: str, chart_path: str = CHART_PATH
 ) -> str:
-    """
-    Renders an institutional-grade equity curve & drawdown chart to PNG
-    using Matplotlib's headless Agg backend.
-    """
+    """Renders institutional-grade equity curve & drawdown chart."""
     plt.style.use("dark_background")
     fig, (ax1, ax2) = plt.subplots(
         2, 1, figsize=(13, 7.5), gridspec_kw={"height_ratios": [3, 1]}, sharex=True
@@ -1355,7 +1310,7 @@ def generate_backtest_chart(
 
     title_str = (
         f"{ENGINE_NAME} | XAUUSD [{feed_source}] "
-        f"(ATR={best_metrics.atr_period}, Z={best_metrics.z_threshold:.1f})"
+        f"(ATR={best_metrics.atr_period}, Z={best_metrics.z_threshold:.1f}, Trail={TRAILING_ATR_MULT:.2f}xATR)"
     )
     ax1.set_title(title_str, fontsize=12.5, fontweight="bold", color="#F9FAFB", pad=12)
     ax1.set_ylabel("Account Equity ($)", fontsize=10, color="#D1D5DB")
@@ -1402,12 +1357,7 @@ def generate_backtest_chart(
 def manage_active_trailing_stops(
     conn: sqlite3.Connection, latest_bar: pd.Series, current_atr: float
 ) -> Tuple[str, List[str]]:
-    """
-    Evaluates open positions stored in SQLite against current Spot Gold price:
-    - Once TP1 is breached, shifts Stop Loss to Breakeven (Entry).
-    - Engages fractional-ATR (0.75 * ATR) trailing step behind favorable extremes.
-    - Closes positions when SL or TP3 is hit.
-    """
+    """Evaluates open positions in SQLite against current price."""
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
     curr_high = float(latest_bar["High"])
     curr_low = float(latest_bar["Low"])
@@ -1459,7 +1409,7 @@ def manage_active_trailing_stops(
                     new_sl = max(curr_sl, entry_px)
                     trail_state = "Active @ TP1 Breakeven"
                 if new_tp1_breached:
-                    trail_candidate = new_fav - (0.75 * step_atr)
+                    trail_candidate = new_fav - (TRAILING_ATR_MULT * step_atr)
                     if trail_candidate > new_sl:
                         new_sl = trail_candidate
                     trail_state = f"Active Trailing SL @ {new_sl:.2f}"
@@ -1477,7 +1427,7 @@ def manage_active_trailing_stops(
                     new_sl = min(curr_sl, entry_px)
                     trail_state = "Active @ TP1 Breakeven"
                 if new_tp1_breached:
-                    trail_candidate = new_fav + (0.75 * step_atr)
+                    trail_candidate = new_fav + (TRAILING_ATR_MULT * step_atr)
                     if trail_candidate < new_sl:
                         new_sl = trail_candidate
                     trail_state = f"Active Trailing SL @ {new_sl:.2f}"
@@ -1515,7 +1465,7 @@ def manage_active_trailing_stops(
 
 
 def register_new_position(conn: sqlite3.Connection, signal: QuantitativeSignal) -> None:
-    """Persists newly triggered VERIFIED BUY/SELL positions for trailing-stop tracking."""
+    """Persists newly triggered VERIFIED BUY/SELL positions."""
     if signal.decision not in ("VERIFIED BUY", "VERIFIED SELL"):
         return
 
@@ -1559,7 +1509,7 @@ def evaluate_live_signal(
     feed_source: str,
     swissquote_mid: Optional[float],
 ) -> Tuple[QuantitativeSignal, Dict[str, Any]]:
-    """Evaluates the latest 15m candle using optimal Grid Search parameters."""
+    """Evaluates latest 15m candle using optimal Grid Search parameters."""
     enriched = enrich_features(
         df_15m,
         df_1h,
@@ -1646,6 +1596,7 @@ def evaluate_live_signal(
         "has_real_volume": bool(eval_row["has_real_volume"]),
         "htf_ema20": round(float(eval_row["HTF_EMA20"]), 4),
         "htf_ema50": round(float(eval_row["HTF_EMA50"]), 4),
+        "trailing_atr_mult": TRAILING_ATR_MULT,
         "breakdown": breakdown,
     }
 
@@ -1661,7 +1612,7 @@ def build_forensic_report_html(
     chart_status: str,
     db_status: str,
 ) -> str:
-    """Formats the exact Institutional Forensic Report template in Telegram HTML."""
+    """Formats the Institutional Forensic Report template in Telegram HTML."""
     return (
         f"🛡️ <b>{ENGINE_NAME} (ULTIMATE EDITION)</b> 🛡️\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1677,6 +1628,7 @@ def build_forensic_report_html(
         f"⚙️ <b>Grid Search &amp; Visualization:</b>\n"
         f"• <i>Optimal ATR Period:</i> {best_metrics.atr_period}\n"
         f"• <i>Optimal Z-Threshold:</i> {best_metrics.z_threshold:.1f}\n"
+        f"• <i>Trailing ATR Step:</i> {TRAILING_ATR_MULT:.2f}x\n"
         f"• <i>Backtest Chart:</i> {chart_status}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>Risk &amp; Position Sizing:</b>\n"
@@ -1796,6 +1748,7 @@ def main() -> int:
     conn: Optional[sqlite3.Connection] = None
     try:
         print(f"[BOOT] Initializing {ENGINE_NAME} (MT5-Aligned Spot Gold Pipeline)...")
+        print(f"[CONFIG] Trailing ATR Multiplier: {TRAILING_ATR_MULT:.2f}x (widened from 0.75)")
         conn = init_sqlite_db(DB_PATH)
 
         # 1. Fetch & Clean Spot Gold Feed + Circuit Breaker
