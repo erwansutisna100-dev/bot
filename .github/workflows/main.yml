@@ -2,7 +2,6 @@ name: 40
 
 on:
   schedule:
-    # Every 15 minutes
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
@@ -43,6 +42,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # ─── Verifikasi Telegram (opsional, bisa dihapus setelah tes) ───
+      - name: Verify Telegram credentials
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID kosong."
+            exit 0
+          fi
+          GETME=$(curl -sS --max-time 15 \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe") || true
+          if echo "$GETME" | jq -e '.ok == true' >/dev/null 2>&1; then
+            echo "✅ Token valid (bot: @$(echo "$GETME" | jq -r '.result.username'))"
+          else
+            echo "::warning::Token Telegram INVALID: $(echo "$GETME" | jq -r '.description // "network"')"
+          fi
+      # ────────────────────────────────────────────────────────────────
 
       - name: Run APEX-QUANT-OMNI bot
         run: python main.py
