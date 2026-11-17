@@ -62,7 +62,7 @@ jobs:
           ACCOUNT_BALANCE: "10000.0"
           RISK_PERCENTAGE: "1.0"
           MPLBACKEND: "Agg"
-        run: python main.py
+        run: python bot.py
 
       - name: Upload Artifacts
         if: always()
