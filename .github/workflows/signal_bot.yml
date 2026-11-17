@@ -1,0 +1,61 @@
+name: APEX-QUANT-OMNI XAUUSD Signal Engine
+
+on:
+  schedule:
+    # Runs every 15 minutes during active market hours (Mon-Fri)
+    - cron: "*/15 * * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-quant-engine:
+    name: Execute XAUUSD Quant Engine & Dispatch Signals
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore Persistent SQLite Signal Database
+        uses: actions/cache@v4
+        with:
+          path: trading_signals.db
+          key: xauusd-sqlite-db-${{ github.run_id }}
+          restore-keys: |
+            xauusd-sqlite-db-
+
+      - name: Run APEX-QUANT-OMNI ENTERPRISE v40.0
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ACCOUNT_BALANCE: "10000.0"
+          RISK_PERCENTAGE: "1.0"
+          MPLBACKEND: "Agg"
+        run: |
+          python bot.py
+
+      - name: Upload Backtest Chart & SQLite Forensic Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apex-quant-omni-artifacts-${{ github.run_number }}
+          path: |
+            backtest_performance.png
+            trading_signals.db
+          if-no-files-found: warn
+          retention-days: 30
