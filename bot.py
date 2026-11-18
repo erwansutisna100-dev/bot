@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-APEX-QUANT-OMNI SOVEREIGN v75.1 (Forensic Hardened & 2-Way Command Edition)
+APEX-QUANT-OMNI SOVEREIGN v75.2 (Macro News Governor & 2-Way Command Edition)
 Institutional-Grade Automated XAUUSD (Spot Gold) Signal Generation,
 Multi-Source Failover + Live Swissquote BBO Spread Calibration,
+High-Impact USD News Blackout Governor (CPI/NFP/FOMC),
 Grid-Search Optimization, Auto-Trailing Stop, SQLite Forensic Audit,
 and Interactive 2-Way Telegram Command Engine.
 """
@@ -22,7 +23,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -33,12 +34,13 @@ import yfinance as yf
 # ==============================================================================
 # GLOBAL CONSTANTS & CONFIGURATION
 # ==============================================================================
-ENGINE_VERSION = "v75.1"
+ENGINE_VERSION = "v75.2"
 SYMBOL_PRIMARY = "XAUUSD=X"  # Spot Gold (Explicitly avoiding futures GC=F)
 ASSET_LABEL = "XAUUSD (SPOT GOLD)"
 DB_PATH = os.getenv("SQLITE_DB_PATH", "trading_signals.db")
 CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
 EPSILON = 1e-8
+WIB_TZ = timezone(timedelta(hours=7))
 
 # Account & Risk Defaults
 DEFAULT_ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "10000.0"))
@@ -48,6 +50,15 @@ MIN_LOT_SIZE = 0.01
 MAX_LOT_SIZE = 50.00
 CONFLUENCE_THRESHOLD = int(os.getenv("CONFLUENCE_THRESHOLD", "65"))
 MAX_ALLOWED_SPREAD_USD = float(os.getenv("MAX_ALLOWED_SPREAD_USD", "3.00"))
+
+# High-Impact USD News Governor Settings
+NEWS_BLACKOUT_BEFORE_MIN = int(os.getenv("NEWS_BLACKOUT_BEFORE_MIN", "45"))
+NEWS_BLACKOUT_AFTER_MIN = int(os.getenv("NEWS_BLACKOUT_AFTER_MIN", "30"))
+NEWS_CACHE_TTL_SECONDS = int(os.getenv("NEWS_CACHE_TTL_SECONDS", "14400"))  # 4 Hours
+TIER1_GOLD_CATALYSTS = (
+    "CPI", "NON-FARM", "NFP", "FOMC", "FEDERAL FUNDS", "POWELL",
+    "PCE", "PPI", "GDP", "UNEMPLOYMENT", "RETAIL SALES", "ISM", "JOLTS",
+)
 
 # Secrets & Webhook Endpoints
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -82,6 +93,26 @@ class SpotQuote:
 
 
 @dataclass
+class NewsEvent:
+    title: str
+    event_utc: str
+    impact: str
+    forecast: str
+    previous: str
+    is_tier1_catalyst: bool
+
+
+@dataclass
+class NewsGovernorStatus:
+    is_allowed: bool
+    guard_state: str
+    reason: str
+    source: str
+    active_blackout_event: Optional[str]
+    upcoming_events: List[NewsEvent]
+
+
+@dataclass
 class SessionStatus:
     is_allowed: bool
     session_name: str
@@ -112,6 +143,7 @@ class SignalReport:
     data_source: str
     spot_quote: Optional[SpotQuote]
     session_status: SessionStatus
+    news_status: NewsGovernorStatus
     signal_decision: str  # "VERIFIED BUY", "VERIFIED SELL", or "NEUTRAL / HOLD"
     entry_price: float
     stop_loss: float
@@ -160,7 +192,6 @@ def request_with_exponential_backoff(
             if resp.status_code in (200, 201, 204):
                 return resp
 
-            # Do not waste retries on hard 404 Not Found
             if resp.status_code == 404:
                 logger.warning(f"HTTP 404 on {url}; failing over immediately.")
                 return resp
@@ -282,6 +313,7 @@ def send_discord_webhook(report: SignalReport) -> bool:
             f"**Signal Decision:** `{report.signal_decision}`\n"
             f"**Trailing Stop Protocol:** `{report.trailing_stop_protocol}`\n"
             f"**Session Governor:** `{report.session_status.session_name}`\n"
+            f"**Macro News Governor:** `{report.news_status.guard_state}`\n"
             f"**Live Spot BBO:** {spread_str}"
         ),
         "color": color,
@@ -447,6 +479,14 @@ def forensic_audit_log(report: SignalReport, db_path: str = DB_PATH) -> None:
     raw_payload = {
         "pillar_breakdown": report.pillar_breakdown,
         "session": asdict(report.session_status),
+        "news_governor": {
+            "is_allowed": report.news_status.is_allowed,
+            "guard_state": report.news_status.guard_state,
+            "reason": report.news_status.reason,
+            "source": report.news_status.source,
+            "active_blackout_event": report.news_status.active_blackout_event,
+            "upcoming_events": [asdict(ev) for ev in report.news_status.upcoming_events],
+        },
         "spot_quote": asdict(report.spot_quote) if report.spot_quote else None,
         "z_score": report.z_score,
         "atr_value": report.atr_value,
@@ -474,6 +514,10 @@ def forensic_audit_log(report: SignalReport, db_path: str = DB_PATH) -> None:
         f"Z-Score={report.z_score:.4f} | ATR={report.atr_value:.4f} | "
         f"SMC={report.smc_state} | OrderFlow={report.order_flow_state} | "
         f"MTF={report.mtf_harmony_state}"
+    )
+    logger.info(
+        f"NewsGovernor={report.news_status.guard_state} ({report.news_status.reason}) | "
+        f"Session={report.session_status.session_name}"
     )
     logger.info(
         f"GridSearch(ATR={report.optimal_atr_period}, Z={report.optimal_z_threshold:.1f}) | "
@@ -507,7 +551,7 @@ def forensic_audit_log(report: SignalReport, db_path: str = DB_PATH) -> None:
                 report.asset,
                 report.data_source,
                 report.session_status.session_name,
-                1 if report.session_status.is_allowed else 0,
+                1 if (report.session_status.is_allowed and report.news_status.is_allowed) else 0,
                 report.signal_decision,
                 float(report.entry_price),
                 float(report.stop_loss),
@@ -535,6 +579,166 @@ def forensic_audit_log(report: SignalReport, db_path: str = DB_PATH) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+# ==============================================================================
+# MACRO HIGH-IMPACT USD NEWS CALENDAR GOVERNOR (CPI / NFP / FOMC)
+# ==============================================================================
+def _fetch_raw_economic_calendar() -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Fetches weekly macro calendar JSON from ForexFactory public CDN with
+    4-hour SQLite caching so GitHub Actions never triggers rate limits.
+    """
+    now_epoch = int(time.time())
+    cached_ts_str = get_bot_state("usd_news_cache_ts", "0")
+    cached_json_str = get_bot_state("usd_news_cache_json", "")
+
+    if cached_ts_str.isdigit() and cached_json_str:
+        age = now_epoch - int(cached_ts_str)
+        if age < NEWS_CACHE_TTL_SECONDS:
+            try:
+                parsed = json.loads(cached_json_str)
+                if isinstance(parsed, list):
+                    return parsed, "SQLite Cache (ForexFactory Weekly)"
+            except ValueError:
+                pass
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        )
+    }
+    endpoints = (
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
+    )
+    for url in endpoints:
+        resp = request_with_exponential_backoff(
+            "GET", url, max_retries=1, backoff_delays=(2,), timeout=10, headers=headers
+        )
+        if resp is not None and resp.status_code == 200:
+            try:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    set_bot_state("usd_news_cache_ts", str(now_epoch))
+                    set_bot_state("usd_news_cache_json", json.dumps(data))
+                    return data, "Live ForexFactory Weekly JSON"
+            except ValueError:
+                continue
+
+    # Stale cache fallback if live CDN temporarily unavailable
+    if cached_json_str:
+        try:
+            parsed = json.loads(cached_json_str)
+            if isinstance(parsed, list):
+                return parsed, "Stale Cache Fallback"
+        except ValueError:
+            pass
+
+    return [], "Fallback (Deterministic NFP Guard)"
+
+
+def evaluate_news_governor(now_utc: Optional[datetime] = None) -> NewsGovernorStatus:
+    """
+    Checks upcoming & active High-Impact USD events (CPI, NFP, FOMC, PCE, GDP, etc.).
+    Suppresses automated execution within [-45 min, +30 min] of any High-Impact USD release.
+    """
+    now = now_utc or datetime.now(timezone.utc)
+    raw_events, source = _fetch_raw_economic_calendar()
+
+    high_usd_events: List[Tuple[datetime, NewsEvent]] = []
+    for item in raw_events:
+        if not isinstance(item, dict):
+            continue
+        country = str(item.get("country", "")).strip().upper()
+        impact = str(item.get("impact", "")).strip().upper()
+        if country != "USD" or impact != "HIGH":
+            continue
+
+        date_str = str(item.get("date", "")).strip()
+        if not date_str:
+            continue
+        try:
+            ev_dt = datetime.fromisoformat(date_str)
+            if ev_dt.tzinfo is None:
+                ev_dt = ev_dt.replace(tzinfo=timezone.utc)
+            else:
+                ev_dt = ev_dt.astimezone(timezone.utc)
+        except ValueError:
+            continue
+
+        title = str(item.get("title", "USD High-Impact Event")).strip()
+        is_tier1 = any(kw in title.upper() for kw in TIER1_GOLD_CATALYSTS)
+        ev_obj = NewsEvent(
+            title=title,
+            event_utc=ev_dt.isoformat(),
+            impact="HIGH",
+            forecast=str(item.get("forecast", "") or "-").strip(),
+            previous=str(item.get("previous", "") or "-").strip(),
+            is_tier1_catalyst=is_tier1,
+        )
+        high_usd_events.append((ev_dt, ev_obj))
+
+    high_usd_events.sort(key=lambda pair: pair[0])
+
+    # Collect upcoming events within next 48 hours
+    horizon = now + timedelta(hours=48)
+    upcoming_48h: List[NewsEvent] = [
+        ev for dt_ev, ev in high_usd_events if (now - timedelta(minutes=NEWS_BLACKOUT_AFTER_MIN)) <= dt_ev <= horizon
+    ]
+
+    # Check Blackout Window [-NEWS_BLACKOUT_BEFORE_MIN, +NEWS_BLACKOUT_AFTER_MIN]
+    for dt_ev, ev in high_usd_events:
+        diff_min = (dt_ev - now).total_seconds() / 60.0
+        if -NEWS_BLACKOUT_AFTER_MIN <= diff_min <= NEWS_BLACKOUT_BEFORE_MIN:
+            if diff_min >= 0:
+                timing_desc = f"releases in {int(round(diff_min))} min"
+            else:
+                timing_desc = f"released {int(round(abs(diff_min)))} min ago"
+            return NewsGovernorStatus(
+                is_allowed=False,
+                guard_state="NEWS_BLACKOUT_GUARD",
+                reason=f"USD High-Impact [{ev.title}] {timing_desc}. Execution suppressed.",
+                source=source,
+                active_blackout_event=f"{ev.title} ({ev.event_utc})",
+                upcoming_events=upcoming_48h[:8],
+            )
+
+    # Deterministic Fail-Safe NFP First-Friday Safeguard if calendar API failed completely
+    if not raw_events:
+        is_first_friday = now.weekday() == 4 and 1 <= now.day <= 7
+        if is_first_friday and (12 * 60) <= (now.hour * 60 + now.minute) <= (14 * 60 + 30):
+            return NewsGovernorStatus(
+                is_allowed=False,
+                guard_state="NFP_FAILSAFE_BLACKOUT",
+                reason="First-Friday NFP blackout window (12:00-14:30 UTC) active while calendar offline.",
+                source=source,
+                active_blackout_event="US Non-Farm Payrolls (Deterministic Window)",
+                upcoming_events=[],
+            )
+
+    if upcoming_48h:
+        next_ev = upcoming_48h[0]
+        next_dt = datetime.fromisoformat(next_ev.event_utc)
+        mins_away = int(round((next_dt - now).total_seconds() / 60.0))
+        hrs_away = mins_away / 60.0
+        reason_str = (
+            f"Clear | Next USD High-Impact: {next_ev.title} in {hrs_away:.1f}h"
+            if hrs_away >= 1.0
+            else f"Clear | Next USD High-Impact: {next_ev.title} in {mins_away}m"
+        )
+    else:
+        reason_str = "Clear | No USD High-Impact releases within 48h."
+
+    return NewsGovernorStatus(
+        is_allowed=True,
+        guard_state="NEWS_CLEAR",
+        reason=reason_str,
+        source=source,
+        active_blackout_event=None,
+        upcoming_events=upcoming_48h[:8],
+    )
 
 
 # ==============================================================================
@@ -634,7 +838,6 @@ def _normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = df.copy()
-    # MANDATORY SAFEGUARD: Flatten MultiIndex columns automatically
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
@@ -668,7 +871,6 @@ def _normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_index()
     df = df[~df.index.duplicated(keep="last")]
 
-    # Spot Gold feeds without tick volume use range-intensity proxy
     range_proxy = ((df["High"] - df["Low"]).abs() + (df["Close"] - df["Open"]).abs() + EPSILON) * 1000.0
     df["EffectiveVolume"] = np.where(df["Volume"] > 0.0, df["Volume"], range_proxy)
     return df
@@ -703,7 +905,7 @@ def fetch_swissquote_live_spot_quote() -> Optional[SpotQuote]:
 
 
 def _calibrate_dataframe_to_live_spot(df: pd.DataFrame, spot_quote: Optional[SpotQuote]) -> pd.DataFrame:
-    """Applies exact basis calibration to align proxy/feed closing price with live XAU/USD spot mid."""
+    """Applies exact basis calibration to align feed closing price with live XAU/USD spot mid."""
     if df.empty or spot_quote is None:
         return df
     last_close = float(df["Close"].iloc[-1])
@@ -734,7 +936,7 @@ def _fetch_from_yfinance_pair(ticker: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _fetch_from_yahoo_chart_http(ticker: str, interval: str, range_str: str) -> pd.DataFrame:
-    """Secondary Feed: Fast Yahoo Finance v8 HTTP Chart API probe (1 retry max to avoid 25s stalls)."""
+    """Secondary Feed: Fast Yahoo Finance v8 HTTP Chart API probe."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -840,11 +1042,6 @@ def _fetch_from_kraken_spot_gold(interval_min: int, spot_quote: Optional[SpotQuo
 def fetch_xauusd_mtf_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[SpotQuote]]:
     """
     Fault-tolerant Multi-Source Data Ingestion for 15M execution and 1H macro data.
-    Sequentially queries:
-      1. yfinance Spot Gold (XAUUSD=X)
-      2. Yahoo v8 HTTP Chart API (XAUUSD=X)
-      3. Binance Vision Spot Gold (PAXGUSDT) + Swissquote BBO Spot Calibration
-      4. Kraken Public Spot Gold (PAXGUSD) + Swissquote BBO Spot Calibration
     """
     spot_quote = fetch_swissquote_live_spot_quote()
     if spot_quote:
@@ -921,11 +1118,7 @@ def compute_rolling_zscore(series: pd.Series, window: int = 20) -> pd.Series:
 
 
 def analyze_pillar_1_smc(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]:
-    """
-    Pillar I (Smart Money Concepts):
-    Detects confirmed Swing Highs / Swing Lows (fractal k=3), Break of Structure (BOS),
-    and Change of Character (ChoCh). Max 25 points.
-    """
+    """Pillar I (Smart Money Concepts): Swing Highs/Lows, BOS, and ChoCh detection."""
     sub = df.tail(lookback).copy()
     highs = sub["High"].values
     lows = sub["Low"].values
@@ -979,11 +1172,7 @@ def analyze_pillar_1_smc(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]
 
 
 def analyze_pillar_2_order_flow(df: pd.DataFrame, window: int = 10) -> Dict[str, Any]:
-    """
-    Pillar II (Order Flow):
-    Computes volume-weighted body-to-wick ratios and directional pressure delta.
-    Max 20 points.
-    """
+    """Pillar II (Order Flow): Volume-weighted body-to-wick pressure delta."""
     sub = df.tail(window).copy()
     body = sub["Close"] - sub["Open"]
     abs_body = body.abs()
@@ -1027,11 +1216,7 @@ def analyze_pillar_3_zscore(
     z_threshold: float,
     window: int = 20,
 ) -> Dict[str, Any]:
-    """
-    Pillar III (Z-Score Mean Reversion & Statistical Regime):
-    Evaluates rolling Z-Score with division-by-zero guard against optimal threshold.
-    Max 20 points.
-    """
+    """Pillar III (Z-Score Mean Reversion & Statistical Regime) with zero-division guard."""
     z_series = compute_rolling_zscore(df["Close"], window=window)
     z_now = float(z_series.iloc[-1])
     z_prev = float(z_series.iloc[-2]) if len(z_series) >= 2 else z_now
@@ -1052,11 +1237,7 @@ def analyze_pillar_3_zscore(
 
 
 def analyze_pillar_4_mtf_harmony(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Pillar IV (Multi-Timeframe Fractal Harmony):
-    Synchronizes 1-Hour macro trend (EMA 20/50 + 1H SMC) with 15-Minute execution flow.
-    Max 20 points.
-    """
+    """Pillar IV (Multi-Timeframe Fractal Harmony): 1H macro alignment with 15M execution."""
     ema20_1h = df_1h["Close"].ewm(span=20, adjust=False).mean()
     ema50_1h = df_1h["Close"].ewm(span=50, adjust=False).mean()
     ema20_15m = df_15m["Close"].ewm(span=20, adjust=False).mean()
@@ -1090,13 +1271,7 @@ def analyze_pillar_5_atr_risk(
     account_balance: float = DEFAULT_ACCOUNT_BALANCE,
     risk_percent: float = DEFAULT_RISK_PERCENT,
 ) -> Dict[str, Any]:
-    """
-    Pillar V (ATR Risk & Dynamic Sizing):
-    Uses ATR(14) blended with Grid Search optimal ATR period to compute forensic SL,
-    TP1 (1.5R), TP2 (2.5R), TP3 (4.0R, min RRR >= 1:3), and dynamic lot sizing.
-    Uses live Swissquote Ask/Bid entry when available for institutional realism.
-    Max 15 points.
-    """
+    """Pillar V (ATR Risk & Dynamic Sizing): SL, TP1 (1.5R), TP2 (2.5R), TP3 (4.0R), & Lot Sizing."""
     atr_14 = float(compute_atr(df_15m, period=14).iloc[-1])
     atr_opt = float(compute_atr(df_15m, period=optimal_atr_period).iloc[-1])
     atr_exec = (atr_14 + atr_opt) / 2.0
@@ -1164,12 +1339,7 @@ def _simulate_strategy_backtest(
     initial_capital: float = DEFAULT_ACCOUNT_BALANCE,
     risk_pct: float = DEFAULT_RISK_PERCENT,
 ) -> GridSearchResult:
-    """
-    Institutional multi-tier exit simulator:
-      - 50% scaled out at TP1 (1.5R) -> SL immediately shifted to Breakeven
-      - 25% scaled out at TP2 (2.5R) -> SL trails behind TP1 / ATR step
-      - 25% runner targeted at TP3 (4.0R) with fractional ATR trailing stop
-    """
+    """Institutional multi-tier exit simulator (50% TP1 BE, 25% TP2, 25% TP3 ATR trail)."""
     df = df_15m.copy()
     df["ATR"] = compute_atr(df, period=atr_period)
     df["Z"] = compute_rolling_zscore(df["Close"], window=20)
@@ -1396,10 +1566,7 @@ def _simulate_strategy_backtest(
 
 
 def run_grid_search_optimization(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> GridSearchResult:
-    """
-    Programmatically evaluates ATR_PERIOD_GRID x Z_THRESHOLD_GRID and selects
-    the parameter combination yielding the highest Profit Factor.
-    """
+    """Selects optimal (ATR period, Z-Threshold) yielding highest Profit Factor."""
     candidates: List[GridSearchResult] = []
     for atr_p in ATR_PERIOD_GRID:
         for z_thresh in Z_THRESHOLD_GRID:
@@ -1429,15 +1596,11 @@ def generate_backtest_chart(
     grid_res: GridSearchResult,
     chart_path: str = CHART_PATH,
 ) -> str:
-    """
-    Renders institutional multi-panel backtest performance chart safely on headless
-    Linux runners via Agg backend and saves to `backtest_performance.png`.
-    """
+    """Renders multi-panel equity & Z-Score chart safely on headless Linux runners."""
     fig, (ax1, ax2) = plt.subplots(
         2, 1, figsize=(12, 7.8), gridspec_kw={"height_ratios": [2.2, 1.0]}, facecolor="#0B0F19"
     )
 
-    # Panel 1: Equity Curve & High-Water Mark
     ax1.set_facecolor("#111827")
     eq_times = pd.to_datetime(grid_res.timestamps)
     eq_vals = np.array(grid_res.equity_curve, dtype=float)
@@ -1463,7 +1626,6 @@ def generate_backtest_chart(
     ax1.grid(True, color="#1F2937", linestyle=":", linewidth=0.8)
     ax1.legend(loc="upper left", ncol=3, facecolor="#1F2937", edgecolor="#374151", labelcolor="#F9FAFB", fontsize=8)
 
-    # Panel 2: Rolling Z-Score & Threshold Bands
     ax2.set_facecolor("#111827")
     z_tail = compute_rolling_zscore(df_15m["Close"], window=20).tail(250)
     ax2.plot(z_tail.index, z_tail.values, color="#38BDF8", linewidth=1.5, label="Rolling Z-Score (20)")
@@ -1510,10 +1672,7 @@ def update_auto_trailing_stop_engine(
     tp3: float,
     db_path: str = DB_PATH,
 ) -> str:
-    """
-    Monitors active open positions in SQLite. Once price breaches TP1, shifts
-    Stop Loss to Breakeven and engages fractional ATR trailing steps.
-    """
+    """Monitors open positions in SQLite; shifts SL to Breakeven at TP1 + ATR trailing."""
     init_sqlite_db(db_path)
     now_iso = datetime.now(timezone.utc).isoformat()
     conn = sqlite3.connect(db_path)
@@ -1617,11 +1776,10 @@ def update_auto_trailing_stop_engine(
 # MASTER SIGNAL SYNTHESIS & INSTITUTIONAL WEBHOOK FORMATTING
 # ==============================================================================
 def run_full_quant_evaluation(command_listener_status: str = "Active / Ready for /check") -> SignalReport:
-    """
-    Executes the end-to-end 5-Pillar + Grid Search + Chart + Trailing Stop pipeline.
-    """
+    """Executes the end-to-end 5-Pillar + Grid Search + News Governor + Chart pipeline."""
     df_15m, df_1h, data_source, spot_quote = fetch_xauusd_mtf_data()
     session_status = evaluate_market_session(spot_quote=spot_quote)
+    news_status = evaluate_news_governor()
 
     grid_res = run_grid_search_optimization(df_15m, df_1h)
     generate_backtest_chart(df_15m, grid_res, CHART_PATH)
@@ -1682,6 +1840,7 @@ def run_full_quant_evaluation(command_listener_status: str = "Active / Ready for
         data_source=data_source,
         spot_quote=spot_quote,
         session_status=session_status,
+        news_status=news_status,
         signal_decision=signal_decision,
         entry_price=p5["entry"],
         stop_loss=p5["sl"],
@@ -1741,6 +1900,7 @@ def format_institutional_telegram_report(report: SignalReport) -> str:
         f"{bbo_line}"
         f"• <i>Session Governor:</i> {report.session_status.session_name} "
         f"({'OPEN' if report.session_status.is_allowed else 'SUPPRESSED'})\n"
+        f"• <i>USD News Governor:</i> {report.news_status.guard_state} — {report.news_status.reason}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⚙️ <b>Grid Search &amp; Exponential Backoff:</b>\n"
         f"• <i>Optimal ATR Period:</i> {report.optimal_atr_period}\n"
@@ -1765,11 +1925,40 @@ def format_institutional_telegram_report(report: SignalReport) -> str:
 
 
 # ==============================================================================
-# INTERACTIVE 2-WAY TELEGRAM COMMAND HANDLER (/check, /status, /chart, /audit, /help)
+# INTERACTIVE 2-WAY TELEGRAM COMMAND HANDLER (/check, /status, /news, /chart, /audit, /help)
 # ==============================================================================
+def _build_news_message() -> str:
+    news_status = evaluate_news_governor()
+    lines = [
+        f"📅 <b>APEX-QUANT-OMNI {ENGINE_VERSION} — USD HIGH-IMPACT NEWS CALENDAR</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"• <b>Status Governor:</b> {news_status.guard_state}",
+        f"• <b>Keterangan:</b> {news_status.reason}",
+        f"• <b>Blackout Window:</b> -{NEWS_BLACKOUT_BEFORE_MIN}m s/d +{NEWS_BLACKOUT_AFTER_MIN}m",
+        f"• <b>Sumber Feed:</b> {news_status.source}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if not news_status.upcoming_events:
+        lines.append("Tidak ada rilis USD High-Impact dalam 48 jam ke depan.")
+    else:
+        lines.append("<b>Jadwal USD High-Impact (48 Jam Ke Depan):</b>")
+        for ev in news_status.upcoming_events:
+            dt_utc = datetime.fromisoformat(ev.event_utc)
+            dt_wib = dt_utc.astimezone(WIB_TZ)
+            tag = "🔥" if ev.is_tier1_catalyst else "⚠️"
+            lines.append(
+                f"{tag} <b>{ev.title}</b>\n"
+                f"   🕒 <code>{dt_utc.strftime('%d %b %H:%M UTC')}</code> | "
+                f"<code>{dt_wib.strftime('%H:%M WIB')}</code>\n"
+                f"   📊 Forecast: <code>{ev.forecast}</code> | Prev: <code>{ev.previous}</code>"
+            )
+    return "\n".join(lines)
+
+
 def _build_status_message() -> str:
     spot_quote = fetch_swissquote_live_spot_quote()
     session = evaluate_market_session(spot_quote=spot_quote)
+    news_status = evaluate_news_governor()
     init_sqlite_db(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -1803,12 +1992,12 @@ def _build_status_message() -> str:
         f"• <b>Live Spot XAU/USD:</b> {bbo_txt}\n"
         f"• <b>Session Governor:</b> {session.session_name} "
         f"({'ACTIVE' if session.is_allowed else 'SUPPRESSED'})\n"
-        f"• <b>Session Note:</b> {session.reason}\n"
+        f"• <b>USD News Governor:</b> {news_status.guard_state} — {news_status.reason}\n"
         f"• <b>SQLite Audit Records:</b> {total_rows} (Open Trailing Pos: {open_pos})\n"
         f"• <b>Latest Audit Entry:</b> {last_summary}\n"
         f"• <b>UTC Clock:</b> {session.utc_timestamp}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Commands: <code>/check</code> | <code>/status</code> | <code>/chart</code> | <code>/audit</code> | <code>/help</code>"
+        f"Commands: <code>/check</code> | <code>/news</code> | <code>/status</code> | <code>/chart</code> | <code>/audit</code> | <code>/help</code>"
     )
 
 
@@ -1838,7 +2027,8 @@ def process_telegram_commands(poll_timeout: int = 0) -> int:
     """
     Polls Telegram Bot API `getUpdates` for interactive 2-way user commands:
       - /check  : Runs on-demand live XAUUSD quantitative analysis & replies immediately
-      - /status : Reports system health, live Spot BBO, SQLite state, and Session Governor
+      - /news   : Shows upcoming USD High-Impact News (CPI/NFP/FOMC) in UTC & WIB
+      - /status : Reports system health, live Spot BBO, News Guard, & SQLite state
       - /chart  : Sends the latest backtest_performance.png equity curve
       - /audit  : Displays last 5 forensic audit entries from SQLite
       - /help   : Lists available interactive commands
@@ -1884,13 +2074,17 @@ def process_telegram_commands(poll_timeout: int = 0) -> int:
         logger.info(f"Received 2-Way Telegram command [{cmd}] from chat_id={chat_id}")
 
         if cmd == "/check":
-            send_telegram_message("⏳ <i>Executing live XAUUSD 5-Pillar + Grid Search scan...</i>", chat_id=chat_id)
+            send_telegram_message("⏳ <i>Executing live XAUUSD 5-Pillar + News + Grid Search scan...</i>", chat_id=chat_id)
             report = run_full_quant_evaluation(command_listener_status="Active (On-Demand /check Executed)")
             report.webhook_status = "On-Demand /check Reply (Exponential Backoff)"
             forensic_audit_log(report)
             send_telegram_message(format_institutional_telegram_report(report), chat_id=chat_id)
             if os.path.exists(CHART_PATH):
                 send_telegram_photo(CHART_PATH, caption="📊 Live Grid-Optimized Backtest Curve", chat_id=chat_id)
+            processed += 1
+
+        elif cmd == "/news":
+            send_telegram_message(_build_news_message(), chat_id=chat_id)
             processed += 1
 
         elif cmd == "/status":
@@ -1913,8 +2107,9 @@ def process_telegram_commands(poll_timeout: int = 0) -> int:
             help_msg = (
                 f"🤖 <b>APEX-QUANT-OMNI {ENGINE_VERSION} Interactive Commands</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"• <code>/check</code> — Live XAUUSD Signal, Z-Score, SMC &amp; Confluence Scan\n"
-                f"• <code>/status</code> — System Health, Live Spread &amp; Session Governor\n"
+                f"• <code>/check</code> — Live XAUUSD Signal, News, SMC &amp; Confluence Scan\n"
+                f"• <code>/news</code> — Jadwal Berita USD High-Impact (CPI/NFP/FOMC) UTC &amp; WIB\n"
+                f"• <code>/status</code> — System Health, Live Spread &amp; Governors\n"
                 f"• <code>/chart</code> — Latest Grid-Optimized Equity Curve Chart\n"
                 f"• <code>/audit</code> — Last 5 SQLite Forensic Audit Records\n"
                 f"• <code>/help</code> — Show this command menu"
@@ -1931,9 +2126,9 @@ def process_telegram_commands(poll_timeout: int = 0) -> int:
 def execute_scheduled_cycle(force_notify: bool = False) -> None:
     """
     Runs one complete serverless cycle:
-      1. Handles any pending 2-way Telegram user commands (/check, /status, /chart, /audit)
-      2. Runs 5-Pillar Quant Engine + Grid Search + Live Spread Check + Chart
-      3. Evaluates Market Session Governor
+      1. Handles pending 2-way Telegram user commands (/check, /news, /status, /chart, /audit)
+      2. Runs 5-Pillar Quant Engine + Macro USD News Governor + Grid Search + Chart
+      3. Suppresses automated signal alerts during Session/Spread/News Blackout windows
       4. Dispatches webhooks via Exponential Backoff on verified signals (deduped per candle)
     """
     init_sqlite_db(DB_PATH)
@@ -1941,15 +2136,21 @@ def execute_scheduled_cycle(force_notify: bool = False) -> None:
 
     report = run_full_quant_evaluation(command_listener_status="Active / Ready for /check")
     session = report.session_status
+    news = report.news_status
 
     last_notified_candle = get_bot_state("last_notified_candle_utc", "")
     is_new_candle = report.candle_timestamp_utc != last_notified_candle
     is_verified = "VERIFIED" in report.signal_decision
 
-    if not session.is_allowed and not force_notify:
-        report.webhook_status = f"Suppressed by Session Governor ({session.session_name})"
+    if (not session.is_allowed or not news.is_allowed) and not force_notify:
+        reasons = []
+        if not session.is_allowed:
+            reasons.append(f"Session:{session.session_name}")
+        if not news.is_allowed:
+            reasons.append(f"News:{news.guard_state}")
+        report.webhook_status = f"Suppressed ({' & '.join(reasons)})"
         forensic_audit_log(report)
-        logger.info(f"Automated alert suppressed: {session.reason}")
+        logger.info(f"Automated alert suppressed: {report.webhook_status}")
         return
 
     if (is_verified and is_new_candle) or force_notify:
@@ -1970,10 +2171,7 @@ def execute_scheduled_cycle(force_notify: bool = False) -> None:
 
 
 def run_continuous_polling_loop(scan_interval_sec: int = 900) -> None:
-    """
-    Runs a persistent 2-way Telegram command listener with periodic 15-minute
-    scheduled quantitative scans (for VPS / long-running container deployments).
-    """
+    """Runs persistent 2-way Telegram listener with periodic 15-minute scans."""
     logger.info(f"Starting continuous 2-Way Telegram Listener + {scan_interval_sec}s scan loop...")
     last_scan_ts = 0.0
     while True:
