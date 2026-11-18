@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-APEX-QUANT-OMNI SOVEREIGN v75.2 (Macro News Governor & 2-Way Command Edition)
+APEX-QUANT-OMNI SOVEREIGN v75.3 (Macro News Governor & Hardened 2-Way Telegram Edition)
 Institutional-Grade Automated XAUUSD (Spot Gold) Signal Generation,
 Multi-Source Failover + Live Swissquote BBO Spread Calibration,
 High-Impact USD News Blackout Governor (CPI/NFP/FOMC),
 Grid-Search Optimization, Auto-Trailing Stop, SQLite Forensic Audit,
-and Interactive 2-Way Telegram Command Engine.
+and Hardened Interactive 2-Way Telegram Command Engine.
 """
 
 # CRITICAL SERVERLESS SAFEGUARD: Headless Matplotlib Backend MUST be set first
@@ -34,7 +34,7 @@ import yfinance as yf
 # ==============================================================================
 # GLOBAL CONSTANTS & CONFIGURATION
 # ==============================================================================
-ENGINE_VERSION = "v75.2"
+ENGINE_VERSION = "v75.3"
 SYMBOL_PRIMARY = "XAUUSD=X"  # Spot Gold (Explicitly avoiding futures GC=F)
 ASSET_LABEL = "XAUUSD (SPOT GOLD)"
 DB_PATH = os.getenv("SQLITE_DB_PATH", "trading_signals.db")
@@ -250,7 +250,10 @@ def send_telegram_message(
     resp = request_with_exponential_backoff(
         "POST", url, max_retries=3, backoff_delays=(2, 4, 8), json=payload
     )
-    return resp is not None and resp.status_code == 200
+    if resp is not None and resp.status_code == 200:
+        return True
+    logger.error(f"sendMessage failed: status={resp.status_code if resp else 'None'}")
+    return False
 
 
 def send_telegram_photo(
@@ -627,7 +630,6 @@ def _fetch_raw_economic_calendar() -> Tuple[List[Dict[str, Any]], str]:
             except ValueError:
                 continue
 
-    # Stale cache fallback if live CDN temporarily unavailable
     if cached_json_str:
         try:
             parsed = json.loads(cached_json_str)
@@ -682,13 +684,11 @@ def evaluate_news_governor(now_utc: Optional[datetime] = None) -> NewsGovernorSt
 
     high_usd_events.sort(key=lambda pair: pair[0])
 
-    # Collect upcoming events within next 48 hours
     horizon = now + timedelta(hours=48)
     upcoming_48h: List[NewsEvent] = [
         ev for dt_ev, ev in high_usd_events if (now - timedelta(minutes=NEWS_BLACKOUT_AFTER_MIN)) <= dt_ev <= horizon
     ]
 
-    # Check Blackout Window [-NEWS_BLACKOUT_BEFORE_MIN, +NEWS_BLACKOUT_AFTER_MIN]
     for dt_ev, ev in high_usd_events:
         diff_min = (dt_ev - now).total_seconds() / 60.0
         if -NEWS_BLACKOUT_AFTER_MIN <= diff_min <= NEWS_BLACKOUT_BEFORE_MIN:
@@ -705,7 +705,6 @@ def evaluate_news_governor(now_utc: Optional[datetime] = None) -> NewsGovernorSt
                 upcoming_events=upcoming_48h[:8],
             )
 
-    # Deterministic Fail-Safe NFP First-Friday Safeguard if calendar API failed completely
     if not raw_events:
         is_first_friday = now.weekday() == 4 and 1 <= now.day <= 7
         if is_first_friday and (12 * 60) <= (now.hour * 60 + now.minute) <= (14 * 60 + 30):
@@ -1040,9 +1039,7 @@ def _fetch_from_kraken_spot_gold(interval_min: int, spot_quote: Optional[SpotQuo
 
 
 def fetch_xauusd_mtf_data() -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[SpotQuote]]:
-    """
-    Fault-tolerant Multi-Source Data Ingestion for 15M execution and 1H macro data.
-    """
+    """Fault-tolerant Multi-Source Data Ingestion for 15M execution and 1H macro data."""
     spot_quote = fetch_swissquote_live_spot_quote()
     if spot_quote:
         logger.info(
@@ -1925,7 +1922,7 @@ def format_institutional_telegram_report(report: SignalReport) -> str:
 
 
 # ==============================================================================
-# INTERACTIVE 2-WAY TELEGRAM COMMAND HANDLER (/check, /status, /news, /chart, /audit, /help)
+# INTERACTIVE 2-WAY TELEGRAM COMMAND HANDLER (/check, /news, /status, /chart, /audit, /help)
 # ==============================================================================
 def _build_news_message() -> str:
     news_status = evaluate_news_governor()
@@ -2025,13 +2022,8 @@ def _build_audit_history_message() -> str:
 
 def process_telegram_commands(poll_timeout: int = 0) -> int:
     """
-    Polls Telegram Bot API `getUpdates` for interactive 2-way user commands:
-      - /check  : Runs on-demand live XAUUSD quantitative analysis & replies immediately
-      - /news   : Shows upcoming USD High-Impact News (CPI/NFP/FOMC) in UTC & WIB
-      - /status : Reports system health, live Spot BBO, News Guard, & SQLite state
-      - /chart  : Sends the latest backtest_performance.png equity curve
-      - /audit  : Displays last 5 forensic audit entries from SQLite
-      - /help   : Lists available interactive commands
+    Polls Telegram Bot API `getUpdates` via POST JSON (with 409 webhook conflict recovery)
+    for interactive 2-way user commands: /check, /news, /status, /chart, /audit, /help.
     """
     if not TELEGRAM_BOT_TOKEN:
         logger.info("TELEGRAM_BOT_TOKEN missing; skipping 2-way command polling.")
@@ -2041,17 +2033,36 @@ def process_telegram_commands(poll_timeout: int = 0) -> int:
     offset = int(last_offset_str) if last_offset_str.isdigit() else 0
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params: Dict[str, Any] = {"offset": offset, "timeout": poll_timeout, "allowed_updates": ["message"]}
+    payload: Dict[str, Any] = {
+        "offset": offset,
+        "timeout": poll_timeout,
+        "allowed_updates": ["message"],
+    }
     resp = request_with_exponential_backoff(
-        "GET", url, max_retries=2, backoff_delays=(2, 4), timeout=poll_timeout + 10, params=params
+        "POST", url, max_retries=2, backoff_delays=(2, 4), timeout=poll_timeout + 10, json=payload
     )
+
+    if resp is not None and resp.status_code == 409:
+        logger.warning("Telegram 409 Conflict detected (stale webhook active). Clearing webhook...")
+        del_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+        request_with_exponential_backoff("POST", del_url, max_retries=1, json={"drop_pending_updates": False})
+        resp = request_with_exponential_backoff(
+            "POST", url, max_retries=2, backoff_delays=(2, 4), timeout=poll_timeout + 10, json=payload
+        )
+
     if resp is None or resp.status_code != 200:
+        logger.warning(
+            f"Telegram getUpdates failed: status={resp.status_code if resp else 'None'}"
+        )
         return 0
 
     try:
         updates = resp.json().get("result", [])
     except (ValueError, AttributeError):
         return 0
+
+    if updates:
+        logger.info(f"Telegram 2-Way Listener fetched {len(updates)} pending update(s).")
 
     processed = 0
     for upd in updates:
@@ -2067,11 +2078,14 @@ def process_telegram_commands(poll_timeout: int = 0) -> int:
             continue
 
         if TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
-            logger.warning(f"Ignored unauthorized Telegram command from chat_id={chat_id}")
+            logger.warning(
+                f"Ignored unauthorized Telegram command from chat_id={chat_id} "
+                f"(expected={TELEGRAM_CHAT_ID})"
+            )
             continue
 
         cmd = text.split()[0].split("@")[0].lower()
-        logger.info(f"Received 2-Way Telegram command [{cmd}] from chat_id={chat_id}")
+        logger.info(f"Processing 2-Way Telegram command [{cmd}] from chat_id={chat_id}")
 
         if cmd == "/check":
             send_telegram_message("⏳ <i>Executing live XAUUSD 5-Pillar + News + Grid Search scan...</i>", chat_id=chat_id)
