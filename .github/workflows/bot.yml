@@ -1,4 +1,4 @@
-name: APEX-QUANT-OMNI SOVEREIGN v75.0 (XAUUSD Signal & 2-Way Bot)
+name: APEX-QUANT-OMNI SOVEREIGN v75.1 (XAUUSD Signal & 2-Way Bot)
 
 on:
   schedule:
@@ -58,9 +58,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RUN_ID=$(gh run list --workflow="signal_bot.yml" --status=success --limit=1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+          RUN_ID=$(gh run list --repo "${{ github.repository }}" --workflow="signal_bot.yml" --status=success --limit=1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
           if [ -n "$RUN_ID" ]; then
-            gh run download "$RUN_ID" -n apex-quant-forensic-artifacts || true
+            gh run download "$RUN_ID" --repo "${{ github.repository }}" -n apex-quant-forensic-artifacts -D . || true
           fi
 
       - name: Execute APEX-QUANT-OMNI Sovereign Engine
@@ -71,6 +71,7 @@ jobs:
           ACCOUNT_BALANCE: "10000.0"
           RISK_PERCENT: "1.0"
           CONFLUENCE_THRESHOLD: "65"
+          MAX_ALLOWED_SPREAD_USD: "3.00"
           BOT_MODE: ${{ github.event.inputs.mode || 'oneshot' }}
           FORCE_NOTIFY: ${{ github.event.inputs.force_notify || 'false' }}
           MPLBACKEND: "Agg"
