@@ -1,48 +1,28 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-================================================================================
- APEX-QUANT-OMNI SOVEREIGN v75.1  (FORENSIC-HARDENED EDITION)
- Institutional-Grade XAUUSD Hybrid Quantitative Signal Engine
-================================================================================
- v75.1 CORRECTIVE CHANGES (vs v75.0):
-   [FIX-1] _finalize_ohlcv   : eliminate Adj Close / Close duplicate column
-   [FIX-2] atr_series        : Series-type assert + NaN-safe fallback
-   [FIX-3] zscore_series     : clip(-10,10) + fillna(0) — no infinity/NaN
-   [FIX-4] analyze_market    : assert df.columns.is_unique at entry
-   [FIX-5] backtest_params   : assert unique columns per cell
-   [FIX-6] grid_search_opt   : log exception class + full message
-   [FIX-7] pillar_smc/of     : assert Series before to_numpy
-   [FIX-8] source_yfinance   : auto_adjust=True (no Adj Close)
-   [FIX-9] _finalize_ohlcv   : paranoid final uniqueness re-check
-================================================================================
+APEX-QUANT-OMNI SOVEREIGN v75.0 (2-Way Command Edition)
+Institutional-Grade Automated XAUUSD (Spot Gold) Signal Generation,
+Grid-Search Optimization, Auto-Trailing Stop, SQLite Forensic Audit,
+and Interactive 2-Way Telegram Command Engine.
 """
 
-from __future__ import annotations
-
+# CRITICAL SERVERLESS SAFEGUARD: Headless Matplotlib Backend MUST be set first
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-matplotlib.rcParams["figure.autolayout"] = True
-matplotlib.rcParams["axes.grid"] = True
-matplotlib.rcParams["grid.alpha"] = 0.25
+import matplotlib.dates as mdates
 
 import argparse
-import io
 import json
 import logging
-import math
 import os
-import re
 import sqlite3
 import sys
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from html import unescape
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import quote
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,1546 +30,1820 @@ import requests
 import yfinance as yf
 
 # ==============================================================================
-# 1. CONFIGURATION
+# GLOBAL CONSTANTS & CONFIGURATION
 # ==============================================================================
+ENGINE_VERSION = "v75.0"
+SYMBOL_PRIMARY = "XAUUSD=X"  # Spot Gold (Explicitly avoiding futures GC=F)
+ASSET_LABEL = "XAUUSD (SPOT GOLD)"
+DB_PATH = os.getenv("SQLITE_DB_PATH", "trading_signals.db")
+CHART_PATH = os.getenv("BACKTEST_CHART_PATH", "backtest_performance.png")
+EPSILON = 1e-8
 
-VERSION = "75.1"
-SYSTEM_NAME = "APEX-QUANT-OMNI SOVEREIGN"
+# Account & Risk Defaults
+DEFAULT_ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "10000.0"))
+DEFAULT_RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1.0"))
+CONTRACT_OUNCES_PER_LOT = 100.0  # Standard 1.00 XAUUSD Lot = 100 Troy Ounces
+MIN_LOT_SIZE = 0.01
+MAX_LOT_SIZE = 50.00
+CONFLUENCE_THRESHOLD = int(os.getenv("CONFLUENCE_THRESHOLD", "65"))
 
-DB_PATH    = os.environ.get("DB_PATH", "trading_signals.db")
-CHART_PATH = os.environ.get("CHART_PATH", "backtest_performance.png")
+# Secrets & Webhook Endpoints
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
-TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+# Grid Search Parameter Space
+ATR_PERIOD_GRID = [10, 14, 20]
+Z_THRESHOLD_GRID = [1.5, 2.0, 2.5]
 
-ACCOUNT_BALANCE = float(os.environ.get("ACCOUNT_BALANCE", "10000") or 10000)
-RISK_PERCENT    = float(os.environ.get("RISK_PERCENT", "1.0") or 1.0)
-CONTRACT_SIZE   = float(os.environ.get("CONTRACT_SIZE", "100") or 100)
-
-POLL_SECONDS   = int(os.environ.get("POLL_SECONDS", "240") or 240)
-NOTIFY_NEUTRAL = os.environ.get("NOTIFY_NEUTRAL", "0").strip() in ("1","true","True","yes")
-FORCE_NOTIFY   = os.environ.get("FORCE_NOTIFY", "0").strip() in ("1","true","True","yes")
-
-EPS                = 1e-8
-HTTP_TIMEOUT       = 20
-MIN_CONFLUENCE     = 30.0
-Z_WINDOW_DEFAULT   = 50
-ATR_PERIOD_DEFAULT = 14
-ATR_RISK_MULT      = 1.5
-TP_R_MULTIPLES     = (1.5, 2.5, 4.0)
-PARTIAL_WEIGHTS    = (0.50, 0.30, 0.20)
-
-GRID_ATR_PERIODS  = (10, 14, 20)
-GRID_Z_THRESHOLDS = (1.5, 2.0, 2.5)
-
-UA_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
-    "Accept": "application/json,text/plain,*/*",
-}
-
-# --- END SECTION 1 ---
-
-# ==============================================================================
-# 2. LOGGING
-# ==============================================================================
-
+# Logging Setup
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)sZ | %(levelname)-8s | %(name)-12s | %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-    stream=sys.stdout,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("APEX-OMNI")
+logger = logging.getLogger("APEX_QUANT_OMNI")
 
-# --- END SECTION 2 ---
-
-# ==============================================================================
-# 3. GENERIC UTILITIES
-# ==============================================================================
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-def iso_now() -> str:
-    return utcnow().replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-def safe_float(value: Any, fallback: float = 0.0) -> float:
-    try:
-        out = float(value)
-        return fallback if math.isnan(out) or math.isinf(out) else out
-    except (TypeError, ValueError):
-        return fallback
-
-def split_message(text: str, limit: int = 3800) -> List[str]:
-    if len(text) <= limit:
-        return [text]
-    chunks, current = [], ""
-    for line in text.split("\n"):
-        candidate = (current + "\n" + line) if current else line
-        if len(candidate) > limit:
-            if current:
-                chunks.append(current)
-            current = line[:limit]
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
-    return chunks
-
-def strip_html(text: str) -> str:
-    return unescape(re.sub(r"<[^>]+>", "", text))
-
-# --- END SECTION 3 ---
 
 # ==============================================================================
-# 4. SQLITE PERSISTENCE
+# DATA STRUCTURES
 # ==============================================================================
+@dataclass
+class SessionStatus:
+    is_allowed: bool
+    session_name: str
+    reason: str
+    utc_timestamp: str
 
-DDL_STATEMENTS = (
-    """CREATE TABLE IF NOT EXISTS signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
-        symbol TEXT NOT NULL, decision TEXT NOT NULL,
-        entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
-        confluence REAL, lots REAL, risk_usd REAL,
-        atr REAL, zscore REAL, smc_state TEXT, source TEXT, payload TEXT)""",
-    """CREATE TABLE IF NOT EXISTS audit (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
-        level TEXT NOT NULL, event TEXT NOT NULL, metrics TEXT)""",
-    "CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)",
-    """CREATE TABLE IF NOT EXISTS open_positions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id INTEGER,
-        direction TEXT, entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
-        atr REAL, tp1_hit INTEGER DEFAULT 0, last_ts TEXT,
-        status TEXT DEFAULT 'OPEN', updated_ts TEXT)""",
-    """CREATE TABLE IF NOT EXISTS optimization_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT,
-        atr_period INTEGER, z_threshold REAL, trades INTEGER,
-        win_rate REAL, profit_factor REAL, max_drawdown REAL, equity_curve TEXT)""",
-)
-
-def db_connect(path: str = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
-def init_db(conn: sqlite3.Connection) -> None:
-    for ddl in DDL_STATEMENTS:
-        conn.execute(ddl)
-    conn.commit()
-
-def set_state(conn, key, value):
-    conn.execute("INSERT INTO state(key,value) VALUES(?,?) "
-                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                 (str(key), str(value)))
-    conn.commit()
-
-def get_state(conn, key, default=None):
-    row = conn.execute("SELECT value FROM state WHERE key=?", (str(key),)).fetchone()
-    return row["value"] if row else default
-
-def forensic_audit_log(conn, event, metrics=None, level="INFO"):
-    metrics = metrics or {}
-    payload = json.dumps(metrics, default=str, ensure_ascii=False)
-    banner = "=" * 78
-    log.log(getattr(logging, level.upper(), logging.INFO),
-            "\n%s\n[FORENSIC] %s :: %s\n%s\n%s",
-            banner, iso_now(), event, payload, banner)
-    try:
-        conn.execute("INSERT INTO audit(ts,level,event,metrics) VALUES(?,?,?,?)",
-                     (iso_now(), level.upper(), str(event), payload))
-        conn.commit()
-    except sqlite3.Error as exc:
-        log.error("Audit persistence failure: %s", exc)
-
-def persist_signal(conn, sig) -> int:
-    cur = conn.execute(
-        """INSERT INTO signals
-           (ts,symbol,decision,entry,sl,tp1,tp2,tp3,confluence,lots,risk_usd,
-            atr,zscore,smc_state,source,payload)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (sig["timestamp"], sig["symbol"], sig["decision"],
-         float(sig["entry"]), float(sig["sl"]),
-         float(sig["tp1"]), float(sig["tp2"]), float(sig["tp3"]),
-         float(sig["confluence"]), float(sig["lots"]), float(sig["risk_usd"]),
-         float(sig["atr"]), float(sig["zscore"]),
-         str(sig["smc_state"]), str(sig["source"]),
-         json.dumps(sig, default=str, ensure_ascii=False)))
-    conn.commit()
-    return int(cur.lastrowid)
-
-def persist_optimization(conn, row) -> None:
-    conn.execute(
-        """INSERT INTO optimization_runs
-           (ts,atr_period,z_threshold,trades,win_rate,profit_factor,max_drawdown,equity_curve)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        (iso_now(), int(row["atr_period"]), float(row["z_threshold"]),
-         int(row["trades"]), float(row["win_rate"]),
-         float(row["profit_factor"]), float(row["max_drawdown"]),
-         json.dumps(row.get("curve", [])[:400], default=str)))
-    conn.commit()
-
-# --- END SECTION 4 ---
-
-# ==============================================================================
-# 5. EXPONENTIAL BACKOFF HTTP DELIVERY
-# ==============================================================================
-
-def http_post_backoff(url, *, json_payload=None, data=None, headers=None,
-                     max_retries=3, base_delay=2.0, label="webhook"):
-    delays = [base_delay * (2 ** i) for i in range(max_retries)]
-    attempt, last_error = 0, None
-    while attempt <= max_retries:
-        try:
-            resp = requests.post(url, json=json_payload, data=data,
-                                 headers=headers, timeout=HTTP_TIMEOUT)
-            if 200 <= resp.status_code < 300:
-                log.info("[%s] delivered HTTP %s (attempt %d)",
-                         label, resp.status_code, attempt + 1)
-                return resp
-            if resp.status_code == 429:
-                wait = delays[attempt] if attempt < len(delays) else delays[-1]
-                try:
-                    wait = max(wait, float(resp.headers.get("Retry-After", "")))
-                except (TypeError, ValueError):
-                    pass
-                log.warning("[%s] HTTP 429 -> sleeping %.1fs", label, wait)
-                time.sleep(wait)
-                attempt += 1
-                continue
-            if 500 <= resp.status_code < 600:
-                last_error = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-            else:
-                log.error("[%s] non-retryable HTTP %s: %s",
-                          label, resp.status_code, resp.text[:300])
-                return resp
-        except requests.RequestException as exc:
-            last_error = exc
-            log.warning("[%s] attempt %d transport failure: %s",
-                        label, attempt + 1, exc)
-        if attempt < max_retries:
-            wait = delays[attempt]
-            log.info("[%s] backoff -> sleeping %.1fs", label, wait)
-            time.sleep(wait)
-        attempt += 1
-    log.error("[%s] retries exhausted. Last: %s", label, last_error)
-    return None
-
-def tg_api(method: str) -> str:
-    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-
-def send_telegram_html(text: str, chat_id: Optional[str] = None) -> bool:
-    if not TELEGRAM_BOT_TOKEN:
-        return False
-    target = chat_id or TELEGRAM_CHAT_ID
-    if not target:
-        return False
-    ok = True
-    for chunk in split_message(text, 3800):
-        resp = http_post_backoff(
-            tg_api("sendMessage"),
-            json_payload={"chat_id": target, "text": chunk,
-                          "parse_mode": "HTML",
-                          "disable_web_page_preview": True},
-            label="telegram")
-        if resp is None or resp.status_code >= 300:
-            ok = False
-    return ok
-
-def send_discord(text: str) -> bool:
-    if not DISCORD_WEBHOOK_URL:
-        return False
-    plain = strip_html(text)
-    ok = True
-    for chunk in split_message(plain, 1900):
-        resp = http_post_backoff(
-            DISCORD_WEBHOOK_URL,
-            json_payload={"content": chunk,
-                          "username": f"{SYSTEM_NAME} v{VERSION}"},
-            label="discord")
-        if resp is None or resp.status_code >= 300:
-            ok = False
-    return ok
-
-def send_emergency_alert(error_text: str) -> None:
-    body = (f"🚨 <b>{SYSTEM_NAME} v{VERSION} — CRITICAL FAILURE</b> 🚨\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🕒 <b>Timestamp (UTC):</b> {iso_now()}\n"
-            f"🧨 <b>Traceback (tail):</b>\n<pre>{error_text[-1200:]}</pre>")
-    try:
-        send_telegram_html(body)
-    except Exception:
-        log.exception("Emergency Telegram alert failed.")
-    try:
-        send_discord(body)
-    except Exception:
-        log.exception("Emergency Discord alert failed.")
-
-# --- END SECTION 5 ---
-
-# ==============================================================================
-# 6. MULTI-SOURCE FALLBACK DATA PIPELINE (v75.1 FORENSIC-HARDENED)
-# ==============================================================================
-
-_last_yahoo_throttle: float = 0.0
-
-def _yahoo_soft_backoff() -> None:
-    global _last_yahoo_throttle
-    if _last_yahoo_throttle <= 0:
-        return
-    elapsed = time.time() - _last_yahoo_throttle
-    if elapsed < 4.0:
-        time.sleep(4.0 - elapsed)
-
-def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df.copy()
-        df.columns = df.columns.get_level_values(0)
-    return df
-
-def _finalize_ohlcv(df: Optional[pd.DataFrame], min_rows: int = 60) -> Optional[pd.DataFrame]:
-    """
-    [FIX-1] Adj Close vs Close duplicate elimination.
-    [FIX-9] Paranoid final column-uniqueness re-check.
-    """
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return None
-
-    df = df.copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    df.columns = [str(c).strip().lower().replace(" ", "_").replace("-", "_")
-                  for c in df.columns]
-
-    adj_variants = ("adj_close", "adjclose", "adjusted_close")
-    has_close = "close" in df.columns
-    for variant in adj_variants:
-        if variant in df.columns:
-            if has_close:
-                df = df.drop(columns=[variant])
-            else:
-                df = df.rename(columns={variant: "close"})
-                has_close = True
-
-    if "price" in df.columns and "close" not in df.columns:
-        df = df.rename(columns={"price": "close"})
-
-    if df.columns.duplicated().any():
-        dupes = sorted(set(df.columns[df.columns.duplicated()].tolist()))
-        log.warning("Post-normalization duplicate columns -> dropping: %s", dupes)
-        df = df.loc[:, ~df.columns.duplicated(keep="first")]
-
-    for col in ("open", "high", "low", "close"):
-        if col not in df.columns:
-            return None
-
-    if "volume" not in df.columns:
-        df["volume"] = 0.0
-
-    df = df[["open", "high", "low", "close", "volume"]].copy()
-    df = df.apply(pd.to_numeric, errors="coerce")
-    df = df.dropna(subset=["open", "high", "low", "close"])
-    if df.empty:
-        return None
-
-    if not isinstance(df.index, pd.DatetimeIndex):
-        try:
-            df.index = pd.to_datetime(df.index, utc=True)
-        except Exception:
-            return None
-
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-    else:
-        df.index = df.index.tz_convert("UTC")
-
-    df = df[~df.index.duplicated(keep="last")].sort_index()
-    df = df[df["high"] >= df["low"]]
-
-    if not df.columns.is_unique:
-        log.error("Column uniqueness violated after finalize — rejecting frame.")
-        return None
-    if len(df) < min_rows:
-        return None
-    return df
-
-def atr_series(df: pd.DataFrame, period: int = ATR_PERIOD_DEFAULT) -> pd.Series:
-    """[FIX-2] Wilder-style ATR with Series-type assert + NaN-safe fallback."""
-    high  = df["high"].astype(float)
-    low   = df["low"].astype(float)
-    close = df["close"].astype(float)
-    if not (isinstance(high, pd.Series) and isinstance(low, pd.Series)
-            and isinstance(close, pd.Series)):
-        raise ValueError("atr_series: OHLC columns must be 1-D Series. "
-                         "Duplicate columns present? Check _finalize_ohlcv.")
-    prev_close = close.shift(1)
-    true_range = pd.concat(
-        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
-        axis=1).max(axis=1)
-    atr = true_range.rolling(period, min_periods=period).mean()
-    mean_val = atr.mean()
-    if pd.isna(mean_val) or math.isinf(mean_val):
-        mean_val = 0.0
-    atr = atr.fillna(mean_val).fillna(0.0)
-    return atr + EPS
-
-def zscore_series(close: pd.Series, window: int = Z_WINDOW_DEFAULT) -> pd.Series:
-    """[FIX-3] Rolling Z-Score with clip(-10,10) + fillna(0)."""
-    if not isinstance(close, pd.Series):
-        raise ValueError("zscore_series: close must be a 1-D Series.")
-    mean = close.rolling(window, min_periods=window).mean()
-    std  = close.rolling(window, min_periods=window).std(ddof=0)
-    z = (close - mean) / (std + EPS)
-    return z.clip(-10.0, 10.0).fillna(0.0)
-
-def ema_series(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-def resample_htf(df: pd.DataFrame, rule: str = "1h") -> pd.DataFrame:
-    return pd.DataFrame({
-        "open":   df["open"].resample(rule).first(),
-        "high":   df["high"].resample(rule).max(),
-        "low":    df["low"].resample(rule).min(),
-        "close":  df["close"].resample(rule).last(),
-        "volume": df["volume"].resample(rule).sum(),
-    }).dropna(subset=["open", "high", "low", "close"])
-
-def source_yfinance(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
-    """[FIX-8] auto_adjust=True eliminates Adj Close at source."""
-    _yahoo_soft_backoff()
-    try:
-        raw = yf.download(symbol, interval=interval, period=period,
-                          progress=False, auto_adjust=True, threads=False)
-    except Exception as exc:
-        msg = str(exc)
-        if "404" in msg or "delisted" in msg.lower():
-            raise RuntimeError(f"symbol {symbol} delisted/unavailable") from exc
-        raise
-    if raw is None or raw.empty:
-        raise RuntimeError(f"empty feed for {symbol}")
-    finalized = _finalize_ohlcv(raw)
-    if finalized is None:
-        raise RuntimeError(f"finalize rejected data for {symbol}")
-    return finalized
-
-def source_yahoo_chart_api(symbol: str, interval: str = "15m",
-                            range_: str = "5d") -> Optional[pd.DataFrame]:
-    global _last_yahoo_throttle
-    endpoint = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(symbol)}"
-    params = {"interval": interval, "range": range_,
-              "includePrePost": "false", "events": "div,splits"}
-    _yahoo_soft_backoff()
-    try:
-        resp = requests.get(endpoint, params=params,
-                            headers=UA_HEADERS, timeout=HTTP_TIMEOUT)
-        if resp.status_code == 429:
-            _last_yahoo_throttle = time.time()
-            raise RuntimeError("Yahoo Chart API HTTP 429")
-        resp.raise_for_status()
-        payload = resp.json()
-    except requests.RequestException as exc:
-        if "429" in str(exc):
-            _last_yahoo_throttle = time.time()
-        raise
-    result = (payload.get("chart") or {}).get("result") or []
-    if not result:
-        raise RuntimeError(f"chart API returned no result for {symbol}")
-    node = result[0]
-    timestamps = node.get("timestamp") or []
-    quote_ = (node.get("indicators") or {}).get("quote") or [{}]
-    q = quote_[0] if quote_ else {}
-    if not timestamps or "close" not in q:
-        raise RuntimeError(f"chart API missing fields for {symbol}")
-    df = pd.DataFrame({
-        "open":   q.get("open"),
-        "high":   q.get("high"),
-        "low":    q.get("low"),
-        "close":  q.get("close"),
-        "volume": q.get("volume") or [0] * len(timestamps),
-    })
-    df.index = pd.to_datetime(timestamps, unit="s", utc=True)
-    return _finalize_ohlcv(df)
-
-def source_stooq_daily(symbol: str = "xauusd") -> Optional[pd.DataFrame]:
-    url = f"https://stooq.com/q/d/l/?s={quote(symbol)}&i=d"
-    try:
-        resp = requests.get(url, headers=UA_HEADERS, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Stooq HTTP failure: {exc}") from exc
-    text = resp.text.strip()
-    if not text or "Date" not in text.split("\n")[0]:
-        raise RuntimeError("Stooq returned non-CSV content")
-    try:
-        df = pd.read_csv(io.StringIO(text))
-    except Exception as exc:
-        raise RuntimeError(f"Stooq CSV parse error: {exc}") from exc
-    df.columns = [c.lower() for c in df.columns]
-    if "date" not in df.columns:
-        raise RuntimeError("Stooq missing date column")
-    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-    df = df.set_index("date").sort_index()
-    return _finalize_ohlcv(df)
-
-DATA_SOURCES: Tuple[Dict[str, Any], ...] = (
-    {"name": "yfinance-GC=F-15m",        "call": lambda: source_yfinance("GC=F", "15m", "5d")},
-    {"name": "yfinance-PAXG-USD-15m",    "call": lambda: source_yfinance("PAXG-USD", "15m", "5d")},
-    {"name": "yfinance-GLD-15m",         "call": lambda: source_yfinance("GLD", "15m", "5d")},
-    {"name": "yfinance-XAUUSD=X-15m",    "call": lambda: source_yfinance("XAUUSD=X", "15m", "5d")},
-    {"name": "yahoo-chart-GC=F-15m",     "call": lambda: source_yahoo_chart_api("GC=F", "15m", "5d")},
-    {"name": "yahoo-chart-PAXG-USD-15m", "call": lambda: source_yahoo_chart_api("PAXG-USD", "15m", "5d")},
-    {"name": "yahoo-chart-XAUUSD=X-15m", "call": lambda: source_yahoo_chart_api("XAUUSD=X", "15m", "5d")},
-    {"name": "yfinance-GC=F-60m",        "call": lambda: source_yfinance("GC=F", "60m", "1mo")},
-    {"name": "stooq-xauusd-daily",       "call": lambda: source_stooq_daily("xauusd")},
-)
-
-def fetch_market_data() -> Tuple[pd.DataFrame, str, bool]:
-    """Iterate DATA_SOURCES. Returns (df, source_name, degraded_flag)."""
-    errors = []
-    for source in DATA_SOURCES:
-        name = source["name"]
-        try:
-            df = source["call"]()
-            if df is None or df.empty:
-                raise RuntimeError("empty frame")
-            if not df.columns.is_unique:
-                raise RuntimeError(
-                    f"duplicate columns: {df.columns[df.columns.duplicated()].tolist()}")
-            degraded = any(tag in name for tag in ("60m", "daily", "stooq"))
-            return df, name, degraded
-        except Exception as exc:
-            errors.append(f"{name}: {type(exc).__name__}: {exc}")
-            log.warning("Feed source failed -> %s | %s", name, exc)
-    raise RuntimeError("All data sources exhausted:\n" + "\n".join(errors))
-
-# --- END SECTION 6 ---
-
-# ==============================================================================
-# 7. MARKET SESSION GOVERNOR
-# ==============================================================================
-
-def session_governor(ts: Optional[datetime] = None) -> Tuple[bool, str]:
-    """Return (is_open, reason). Blocks weekends and low-liquidity windows."""
-    ts = ts or utcnow()
-    weekday = ts.weekday()  # Mon=0 ... Sun=6
-    hour = ts.hour + ts.minute / 60.0
-
-    if weekday == 5:
-        return False, "Saturday — market closed"
-    if weekday == 6 and hour < 22.0:
-        return False, "Sunday pre-open (before 22:00 UTC)"
-    if weekday == 4 and hour >= 20.5:
-        return False, "Friday close window (after 20:30 UTC)"
-    if weekday == 0 and hour < 0.5:
-        return False, "Monday reopen stabilization"
-    return True, "open"
-
-# --- END SECTION 7 ---
-
-# ==============================================================================
-# 8. FIVE-PILLAR ANALYSIS ENGINE
-# ==============================================================================
 
 @dataclass
-class PillarResult:
-    name:    str
-    score:   float          # -100..+100
-    detail:  str
-    metrics: Dict[str, Any] = field(default_factory=dict)
+class GridSearchResult:
+    optimal_atr_period: int
+    optimal_z_threshold: float
+    win_rate: float
+    profit_factor: float
+    max_drawdown: float
+    total_trades: int
+    net_return_pct: float
+    equity_curve: List[float]
+    timestamps: List[pd.Timestamp]
+    trade_log: List[Dict[str, Any]]
 
-def _assert_series(*series: Tuple[str, Any]) -> None:
-    """[FIX-7] Assert each element is a 1-D pandas Series."""
-    for label, val in series:
-        if not isinstance(val, pd.Series):
-            raise ValueError(
-                f"{label} is {type(val).__name__}, expected pd.Series. "
-                "Duplicate columns likely — check _finalize_ohlcv.")
 
-def pillar_smc(df: pd.DataFrame) -> PillarResult:
-    """Swing-based BOS/CHoCH detection with magnitude weighting."""
-    tail = df.tail(120)
-    highs = tail["high"].to_numpy(dtype=float)
-    lows  = tail["low"].to_numpy(dtype=float)
-    closes = tail["close"].to_numpy(dtype=float)
+@dataclass
+class SignalReport:
+    timestamp_utc: str
+    candle_timestamp_utc: str
+    asset: str
+    data_source: str
+    session_status: SessionStatus
+    signal_decision: str  # "VERIFIED BUY", "VERIFIED SELL", or "NEUTRAL / HOLD"
+    entry_price: float
+    stop_loss: float
+    tp1: float
+    tp2: float
+    tp3: float
+    trailing_stop_protocol: str
+    confluence_score: int
+    z_score: float
+    smc_state: str
+    order_flow_state: str
+    mtf_harmony_state: str
+    atr_value: float
+    optimal_atr_period: int
+    optimal_z_threshold: float
+    recommended_lot: float
+    risk_amount_usd: float
+    win_rate: float
+    profit_factor: float
+    max_drawdown: float
+    command_listener_status: str
+    webhook_status: str
+    pillar_breakdown: Dict[str, Any]
 
-    _assert_series(("high", tail["high"]), ("low", tail["low"]),
-                   ("close", tail["close"]))
-
-    if len(highs) < 20:
-        return PillarResult("smc", 0.0, "insufficient bars", {})
-
-    lookback = 10
-    last_high, last_low = None, None
-    for i in range(lookback, len(highs) - 1):
-        window_high = highs[i - lookback:i + 1]
-        window_low  = lows[i - lookback:i + 1]
-        if highs[i] >= window_high.max() - EPS:
-            last_high = highs[i]
-        if lows[i] <= window_low.min() + EPS:
-            last_low = lows[i]
-
-    price = closes[-1]
-    atr_value = safe_float(atr_series(df, ATR_PERIOD_DEFAULT).iloc[-1], EPS)
-
-    score = 0.0
-    state = "no_structure"
-    if last_high is not None and price > last_high:
-        magnitude = clamp((price - last_high) / (atr_value + EPS), 0.0, 1.0)
-        score = 55.0 + 45.0 * magnitude
-        state = "bullish_BOS"
-    elif last_low is not None and price < last_low:
-        magnitude = clamp((last_low - price) / (atr_value + EPS), 0.0, 1.0)
-        score = -55.0 - 45.0 * magnitude
-        state = "bearish_BOS"
-    elif last_high is not None and last_low is not None:
-        mid = (last_high + last_low) / 2.0
-        score = 20.0 if price > mid else -20.0
-        state = "inside_range"
-
-    return PillarResult("smc", score, state,
-                        {"price": price, "atr": atr_value,
-                         "last_high": last_high, "last_low": last_low})
-
-def pillar_order_flow(df: pd.DataFrame) -> PillarResult:
-    """Body-vs-wick directional pressure."""
-    tail = df.tail(20)
-    opens  = tail["open"].to_numpy(dtype=float)
-    highs  = tail["high"].to_numpy(dtype=float)
-    lows   = tail["low"].to_numpy(dtype=float)
-    closes = tail["close"].to_numpy(dtype=float)
-    volume = tail["volume"].to_numpy(dtype=float)
-
-    _assert_series(("open", tail["open"]), ("close", tail["close"]),
-                   ("high", tail["high"]), ("low", tail["low"]),
-                   ("volume", tail["volume"]))
-
-    if len(closes) < 5:
-        return PillarResult("order_flow", 0.0, "insufficient bars", {})
-
-    if volume.sum() <= 0:
-        volume = np.ones_like(volume)
-
-    body = closes - opens
-    bar_range = np.maximum(highs - lows, EPS)
-    body_ratio = np.clip(np.abs(body) / bar_range, 0.0, 1.0)
-    directional_pressure = np.sign(body) * body_ratio * volume
-
-    total_volume = float(volume.sum()) or 1.0
-    pressure_component = float(directional_pressure.sum() / total_volume) * 60.0
-    pressure_component = clamp(pressure_component, -100.0, 100.0)
-
-    return PillarResult(
-        "order_flow", pressure_component,
-        "bullish_dominant" if pressure_component > 10
-        else "bearish_dominant" if pressure_component < -10
-        else "balanced",
-        {"raw_pressure": pressure_component})
-
-def pillar_zscore(df: pd.DataFrame) -> PillarResult:
-    """Mean-reversion bias via rolling Z-Score."""
-    close = df["close"]
-    _assert_series(("close", close))
-    z_series = zscore_series(close, Z_WINDOW_DEFAULT)
-    z = safe_float(z_series.iloc[-1], 0.0)
-
-    score = clamp(-z * 35.0, -100.0, 100.0)
-    return PillarResult(
-        "zscore", score,
-        f"z={z:+.2f}",
-        {"z": z})
-
-def pillar_mtf(df: pd.DataFrame) -> PillarResult:
-    """Higher-timeframe EMA alignment (resample to 1h)."""
-    htf = resample_htf(df, "1h")
-    slow = 50
-    fast = 20
-
-    if len(htf) < slow + 2:
-        htf = df.copy()
-
-    if len(htf) < max(fast, slow) + 2:
-        return PillarResult("mtf", 0.0, "insufficient HTF bars", {})
-
-    ema_fast = ema_series(htf["close"], fast)
-    ema_slow = ema_series(htf["close"], slow)
-    last_fast = safe_float(ema_fast.iloc[-1], 0.0)
-    last_slow = safe_float(ema_slow.iloc[-1], 0.0)
-    price = safe_float(htf["close"].iloc[-1], 0.0)
-
-    score = 0.0
-    state = "neutral"
-    if last_fast > last_slow and price > last_fast:
-        score = 60.0
-        state = "bullish_aligned"
-    elif last_fast < last_slow and price < last_fast:
-        score = -60.0
-        state = "bearish_aligned"
-    elif last_fast > last_slow:
-        score = 25.0
-        state = "bullish_weak"
-    elif last_fast < last_slow:
-        score = -25.0
-        state = "bearish_weak"
-
-    return PillarResult("mtf", score, state,
-                        {"fast": last_fast, "slow": last_slow, "price": price})
-
-def pillar_atr_regime(df: pd.DataFrame) -> PillarResult:
-    """ATR regime: compresses confluence when volatility is dead."""
-    atr = atr_series(df, ATR_PERIOD_DEFAULT)
-    recent = safe_float(atr.iloc[-1], EPS)
-    baseline = safe_float(atr.tail(50).mean(), EPS)
-    if baseline <= EPS:
-        return PillarResult("atr_regime", 0.0, "unknown", {"multiplier": 1.0})
-
-    ratio = recent / baseline
-    multiplier = clamp(ratio, 0.4, 1.2)
-    state = "expanding" if ratio > 1.15 else "compressed" if ratio < 0.85 else "normal"
-    return PillarResult("atr_regime", 0.0, state,
-                        {"ratio": ratio, "multiplier": multiplier})
-
-# --- END SECTION 8 ---
 
 # ==============================================================================
-# 9. CONFLUENCE SYNTHESIS
+# EXPONENTIAL BACKOFF HTTP & WEBHOOK DELIVERY ENGINE
 # ==============================================================================
-
-PILLAR_WEIGHTS = {
-    "smc":        0.30,
-    "order_flow": 0.20,
-    "zscore":     0.30,
-    "mtf":        0.20,
-}
-
-def synthesize_confluence(pillars: Sequence[PillarResult]) -> Dict[str, Any]:
-    signed = 0.0
-    quality_multiplier = 1.0
-    for pillar in pillars:
-        weight = PILLAR_WEIGHTS.get(pillar.name, 0.0)
-        signed += pillar.score * weight
-        if pillar.name == "atr_regime":
-            quality_multiplier = float(pillar.metrics.get("multiplier", 1.0))
-
-    signed *= quality_multiplier
-    signed = clamp(signed, -100.0, 100.0)
-
-    if signed >= MIN_CONFLUENCE:
-        decision = "BUY"
-    elif signed <= -MIN_CONFLUENCE:
-        decision = "SELL"
-    else:
-        decision = "NEUTRAL"
-
-    return {
-        "confluence": round(signed, 2),
-        "decision":   decision,
-        "quality_multiplier": round(quality_multiplier, 3),
-        "pillars":    [{"name": p.name, "score": round(p.score, 2),
-                        "detail": p.detail, "metrics": p.metrics}
-                       for p in pillars],
-    }
-
-# --- END SECTION 9 ---
-
-# ==============================================================================
-# 10. RISK MANAGEMENT & POSITION SIZING
-# ==============================================================================
-
-def position_size(entry: float, stop: float, balance: float,
-                  risk_pct: float, contract: float) -> Tuple[float, float]:
-    stop_distance = abs(entry - stop)
-    if stop_distance <= EPS:
-        return 0.01, 0.0
-    risk_usd = balance * (risk_pct / 100.0)
-    lots = risk_usd / (stop_distance * contract)
-    lots = max(round(lots, 2), 0.01)
-    return lots, round(risk_usd, 2)
-
-def build_risk_levels(direction: str, entry: float, atr: float,
-                      atr_mult: float = ATR_RISK_MULT,
-                      tp_mults: Sequence[float] = TP_R_MULTIPLES) -> Dict[str, float]:
-    stop_distance = max(atr * atr_mult, EPS)
-    if direction == "BUY":
-        sl = entry - stop_distance
-        tps = [entry + stop_distance * r for r in tp_mults]
-    else:
-        sl = entry + stop_distance
-        tps = [entry - stop_distance * r for r in tp_mults]
-    return {
-        "entry": round(entry, 2),
-        "sl":    round(sl, 2),
-        "tp1":   round(tps[0], 2),
-        "tp2":   round(tps[1], 2),
-        "tp3":   round(tps[2], 2),
-        "stop_distance": round(stop_distance, 4),
-    }
-
-# --- END SECTION 10 ---
-# ==============================================================================
-# 11. MARKET ANALYSIS (v75.1 — [FIX-4])
-# ==============================================================================
-
-def analyze_market(df: pd.DataFrame, source: str, degraded: bool,
-                   optimization: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def request_with_exponential_backoff(
+    method: str,
+    url: str,
+    max_retries: int = 3,
+    backoff_delays: Tuple[int, ...] = (2, 4, 8),
+    timeout: int = 15,
+    **kwargs: Any,
+) -> Optional[requests.Response]:
     """
-    Orchestrate all 5 pillars, synthesize confluence, build risk levels.
-
-    [FIX-4] Fail-fast if df has duplicate columns (defense-in-depth).
+    Executes an HTTP request with strict exponential backoff (2s, 4s, 8s)
+    to handle HTTP 429 Rate Limits and transient network/5xx failures.
     """
-    if df is None or len(df) < 30:
-        raise RuntimeError("analyze_market: insufficient market data")
-    if not df.columns.is_unique:
-        dupes = df.columns[df.columns.duplicated()].tolist()
-        raise ValueError(f"analyze_market: duplicate columns present: {dupes}")
-
-    atr_period = ATR_PERIOD_DEFAULT
-    z_threshold = 2.0
-    if optimization:
-        atr_period = int(optimization.get("optimal_atr_period", ATR_PERIOD_DEFAULT))
-        z_threshold = float(optimization.get("optimal_z_threshold", 2.0))
-
-    pillars = [
-        pillar_smc(df),
-        pillar_order_flow(df),
-        pillar_zscore(df),
-        pillar_mtf(df),
-        pillar_atr_regime(df),
-    ]
-
-    conf = synthesize_confluence(pillars)
-    decision = conf["decision"]
-    confluence = conf["confluence"]
-
-    atr_value = safe_float(atr_series(df, atr_period).iloc[-1], EPS)
-    z_val = safe_float(zscore_series(df["close"], Z_WINDOW_DEFAULT).iloc[-1], 0.0)
-    price = safe_float(df["close"].iloc[-1], 0.0)
-
-    levels = build_risk_levels(
-        decision if decision != "NEUTRAL" else "BUY", price, atr_value)
-    lots, risk_usd = position_size(
-        levels["entry"], levels["sl"],
-        ACCOUNT_BALANCE, RISK_PERCENT, CONTRACT_SIZE)
-
-    smc_pillar = next((p for p in pillars if p.name == "smc"), None)
-    smc_state = smc_pillar.detail if smc_pillar else "unknown"
-
-    return {
-        "timestamp": iso_now(),
-        "symbol": "XAUUSD",
-        "decision": decision,
-        "confluence": confluence,
-        "entry": levels["entry"],
-        "sl": levels["sl"],
-        "tp1": levels["tp1"],
-        "tp2": levels["tp2"],
-        "tp3": levels["tp3"],
-        "lots": lots,
-        "risk_usd": risk_usd,
-        "atr": atr_value,
-        "zscore": z_val,
-        "smc_state": smc_state,
-        "source": source,
-        "degraded": degraded,
-        "pillars": conf["pillars"],
-        "quality_multiplier": conf["quality_multiplier"],
-        "atr_period_used": atr_period,
-        "z_threshold_used": z_threshold,
-    }
-
-# --- END SECTION 11 ---
-
-# ==============================================================================
-# 12. BACKTEST + GRID SEARCH (v75.1 — [FIX-5] [FIX-6])
-# ==============================================================================
-
-def backtest_params(
-    df: pd.DataFrame,
-    atr_period: int,
-    z_threshold: float,
-    atr_mult: float = ATR_RISK_MULT,
-    rr: Sequence[float] = TP_R_MULTIPLES,
-    risk_usd: float = 100.0,
-) -> Dict[str, Any]:
-    """
-    Vectorized-scan backtest: open trades on Z-Score crosses, track partial TPs.
-
-    [FIX-5] Assert unique columns + Series-type before building work frame.
-    """
-    empty = {"trades": 0, "win_rate": 0.0, "profit_factor": 0.0,
-             "max_drawdown": 0.0, "curve": [0.0]}
-
-    if df is None or len(df) < 60:
-        return empty
-    if df.columns.duplicated().any():
-        raise ValueError(
-            f"backtest_params: duplicate columns: "
-            f"{df.columns[df.columns.duplicated()].tolist()}")
-    for col in ("open", "high", "low", "close"):
-        if not isinstance(df[col], pd.Series):
-            raise ValueError(f"backtest_params: '{col}' is not a Series")
-
-    work = pd.DataFrame({
-        "open":  df["open"].astype(float),
-        "high":  df["high"].astype(float),
-        "low":   df["low"].astype(float),
-        "close": df["close"].astype(float),
-    })
-    work["atr"] = atr_series(work, atr_period)
-    work["z"]   = zscore_series(work["close"], Z_WINDOW_DEFAULT)
-    work = work.dropna(subset=["atr", "z"])
-    if len(work) < 30:
-        return empty
-
-    opens  = work["open"].to_numpy()
-    highs  = work["high"].to_numpy()
-    lows   = work["low"].to_numpy()
-    closes = work["close"].to_numpy()
-    atrs   = work["atr"].to_numpy()
-    zs     = work["z"].to_numpy()
-    index  = work.index
-
-    def _open(direction: str, price: float, atr: float) -> Dict[str, Any]:
-        stop_distance = max(atr * atr_mult, EPS)
-        if direction == "BUY":
-            sl = price - stop_distance
-            tps = [price + stop_distance * r for r in rr]
-        else:
-            sl = price + stop_distance
-            tps = [price - stop_distance * r for r in rr]
-        return {"direction": direction, "entry": price, "sl": sl,
-                "tps": list(tps), "sl_dist": stop_distance,
-                "remaining": 1.0, "realized": 0.0}
-
-    def _finalize(pos: Dict[str, Any], exit_price: float, bar_i: int) -> None:
-        if pos["remaining"] <= 0:
-            return
-        r_dist = (exit_price - pos["entry"]) / pos["sl_dist"]
-        if pos["direction"] == "SELL":
-            r_dist = -r_dist
-        pos["realized"] += pos["remaining"] * r_dist
-        pos["remaining"] = 0.0
-        trades.append({"r": pos["realized"],
-                       "pnl": pos["realized"] * risk_usd,
-                       "ts": str(index[bar_i])})
-
-    trades: List[Dict[str, Any]] = []
-    position: Optional[Dict[str, Any]] = None
-    curve: List[float] = [0.0]
-    equity = 0.0
-
-    for i in range(len(work)):
-        if position is None:
-            if i > 0:
-                if zs[i - 1] > -z_threshold and zs[i] <= -z_threshold:
-                    position = _open("BUY", closes[i], atrs[i])
-                elif zs[i - 1] < z_threshold and zs[i] >= z_threshold:
-                    position = _open("SELL", closes[i], atrs[i])
-            if position is None:
-                curve.append(equity)
-                continue
-
-        bar_high = highs[i]
-        bar_low = lows[i]
-
-        if position["direction"] == "BUY":
-            if bar_low <= position["sl"]:
-                _finalize(position, position["sl"], i)
-                position = None
-            else:
-                for tp_idx, tp in enumerate(position["tps"]):
-                    if position["remaining"] <= 0:
-                        break
-                    if bar_high >= tp:
-                        portion = (PARTIAL_WEIGHTS[tp_idx]
-                                   if tp_idx < len(PARTIAL_WEIGHTS)
-                                   else position["remaining"])
-                        r_tp = (tp - position["entry"]) / position["sl_dist"]
-                        position["realized"] += portion * r_tp
-                        position["remaining"] -= portion
-                        if tp_idx == 0:
-                            position["sl"] = max(position["sl"], position["entry"])
-        else:
-            if bar_high >= position["sl"]:
-                _finalize(position, position["sl"], i)
-                position = None
-            else:
-                for tp_idx, tp in enumerate(position["tps"]):
-                    if position["remaining"] <= 0:
-                        break
-                    if bar_low <= tp:
-                        portion = (PARTIAL_WEIGHTS[tp_idx]
-                                   if tp_idx < len(PARTIAL_WEIGHTS)
-                                   else position["remaining"])
-                        r_tp = (position["entry"] - tp) / position["sl_dist"]
-                        position["realized"] += portion * r_tp
-                        position["remaining"] -= portion
-                        if tp_idx == 0:
-                            position["sl"] = min(position["sl"], position["entry"])
-
-        if position is not None and position["remaining"] <= 0:
-            trades.append({"r": position["realized"],
-                           "pnl": position["realized"] * risk_usd,
-                           "ts": str(index[i])})
-            position = None
-
-        if position is not None:
-            direction_sign = 1 if position["direction"] == "BUY" else -1
-            unrealized = (position["remaining"]
-                          * ((closes[i] - position["entry"]) / position["sl_dist"])
-                          * direction_sign)
-            curve.append(equity + position["realized"] + unrealized)
-        else:
-            equity = sum(t["r"] for t in trades) * risk_usd
-            curve.append(equity)
-
-    if position is not None:
-        _finalize(position, closes[-1], len(work) - 1)
-        equity = sum(t["r"] for t in trades) * risk_usd
-        curve[-1] = equity
-
-    if not trades:
-        return empty
-
-    wins = [t for t in trades if t["r"] > 0]
-    losses = [t for t in trades if t["r"] < 0]
-    win_rate = len(wins) / len(trades) * 100.0
-    gross_win = sum(t["r"] for t in wins)
-    gross_loss = abs(sum(t["r"] for t in losses))
-    profit_factor = (gross_win / gross_loss if gross_loss > EPS
-                     else (gross_win if gross_win > 0 else 0.0))
-
-    peak = -float("inf")
-    max_dd = 0.0
-    for val in curve:
-        peak = max(peak, val)
-        if peak > 0:
-            max_dd = max(max_dd, (peak - val) / peak)
-
-    return {
-        "trades": len(trades),
-        "win_rate": round(win_rate, 2),
-        "profit_factor": round(profit_factor, 3),
-        "max_drawdown": round(max_dd * 100.0, 2),
-        "curve": curve,
-    }
-
-
-def grid_search_optimize(df: pd.DataFrame,
-                          conn: Optional[sqlite3.Connection] = None
-                          ) -> Dict[str, Any]:
-    """9-cell grid over (ATR period, Z threshold). [FIX-6] log class name."""
-    results: List[Dict[str, Any]] = []
-    cells = 0
-    for atr_period in GRID_ATR_PERIODS:
-        for z_threshold in GRID_Z_THRESHOLDS:
-            cells += 1
-            try:
-                res = backtest_params(df, atr_period, z_threshold)
-                res["atr_period"] = atr_period
-                res["z_threshold"] = z_threshold
-                results.append(res)
-            except Exception as exc:
-                log.warning("Grid cell ATR=%s Z=%s failed: %s: %s",
-                            atr_period, z_threshold,
-                            type(exc).__name__, exc)
-
-    if not results:
-        log.error("Grid search produced zero results across %d cells", cells)
-        return {
-            "optimal_atr_period": ATR_PERIOD_DEFAULT,
-            "optimal_z_threshold": 2.0,
-            "profit_factor": 0.0, "win_rate": 0.0,
-            "max_drawdown": 0.0, "trades": 0,
-            "cells_evaluated": cells,
-            "curve": [0.0],
-        }
-
-    results.sort(key=lambda r: (r["profit_factor"], r["trades"]), reverse=True)
-    best = dict(results[0])
-    best["cells_evaluated"] = cells
-
-    if conn is not None:
+    attempt = 0
+    while attempt <= max_retries:
         try:
-            persist_optimization(conn, best)
-        except Exception as exc:
-            log.warning("Persist optimization failed: %s", exc)
+            resp = requests.request(method=method, url=url, timeout=timeout, **kwargs)
+            if resp.status_code in (200, 201, 204):
+                return resp
 
-    return best
-
-# --- END SECTION 12 ---
-
-# ==============================================================================
-# 13. AUTO-TRAILING STOP ENGINE
-# ==============================================================================
-
-class TrailingStopEngine:
-    """SQLite-persisted position tracker with breakeven + ATR trail."""
-
-    def __init__(self, conn: sqlite3.Connection):
-        self.conn = conn
-
-    def register(self, sig: Dict[str, Any]) -> None:
-        self.conn.execute(
-            """INSERT INTO open_positions
-               (signal_id, direction, entry, sl, tp1, tp2, tp3, atr,
-                tp1_hit, last_ts, status, updated_ts)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (sig.get("signal_id"), sig["decision"],
-             float(sig["entry"]), float(sig["sl"]),
-             float(sig["tp1"]), float(sig["tp2"]), float(sig["tp3"]),
-             float(sig["atr"]), 0, sig["timestamp"], "OPEN", iso_now()))
-        self.conn.commit()
-
-    def refresh(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT * FROM open_positions WHERE status='OPEN'").fetchall()
-        closed: List[Dict[str, Any]] = []
-
-        for row in rows:
-            pos = dict(row)
-            last_ts_raw = pos.get("last_ts") or ""
-            try:
-                last_ts = (pd.to_datetime(last_ts_raw, utc=True)
-                           if last_ts_raw else df.index[0])
-            except Exception:
-                last_ts = df.index[0]
-
-            bars = df[df.index > last_ts]
-            status = pos["status"]
-            sl = float(pos["sl"])
-            tp1_hit = int(pos["tp1_hit"])
-            direction = pos["direction"]
-
-            for _ts, bar in bars.iterrows():
-                bar_high = float(bar["high"])
-                bar_low = float(bar["low"])
-                bar_close = float(bar["close"])
-
-                if direction == "BUY":
-                    if bar_low <= sl:
-                        status = "STOPPED"
-                        break
-                    if not tp1_hit and bar_high >= pos["tp1"]:
-                        tp1_hit = 1
-                        sl = max(sl, pos["entry"])
-                    if tp1_hit:
-                        trail = bar_close - 0.75 * pos["atr"]
-                        sl = max(sl, trail)
-                else:
-                    if bar_high >= sl:
-                        status = "STOPPED"
-                        break
-                    if not tp1_hit and bar_low <= pos["tp1"]:
-                        tp1_hit = 1
-                        sl = min(sl, pos["entry"])
-                    if tp1_hit:
-                        trail = bar_close + 0.75 * pos["atr"]
-                        sl = min(sl, trail)
-
-            new_last_ts = (str(bars.index[-1]) if len(bars) > 0 else str(last_ts))
-
-            self.conn.execute(
-                """UPDATE open_positions
-                   SET sl=?, tp1_hit=?, last_ts=?, status=?, updated_ts=?
-                   WHERE id=?""",
-                (float(sl), int(tp1_hit), new_last_ts, status,
-                 iso_now(), pos["id"]))
-
-            if status == "STOPPED":
-                closed.append({"id": pos["id"], "direction": direction,
-                               "final_sl": sl})
-
-        self.conn.commit()
-        return closed
-
-    def active_positions(self) -> List[Dict[str, Any]]:
-        return [dict(r) for r in self.conn.execute(
-            "SELECT * FROM open_positions WHERE status='OPEN'").fetchall()]
-
-# --- END SECTION 13 ---
-
-# ==============================================================================
-# 14. CHART GENERATOR (HEADLESS MATPLOTLIB)
-# ==============================================================================
-
-def plot_backtest(curve: Sequence[float],
-                   timestamps: Optional[Sequence[str]] = None,
-                   path: str = CHART_PATH) -> Optional[str]:
-    if not curve or len(curve) < 2:
-        return None
-    try:
-        fig, ax = plt.subplots(figsize=(10, 4), dpi=100)
-        ax.plot(range(len(curve)), list(curve),
-                color="#2196F3", linewidth=1.5)
-        ax.fill_between(range(len(curve)), list(curve),
-                         min(curve), alpha=0.15, color="#2196F3")
-        ax.axhline(0, color="gray", linestyle="--", linewidth=0.8)
-        ax.set_title(f"{SYSTEM_NAME} v{VERSION} — Equity Curve")
-        ax.set_ylabel("PnL (R units)")
-        ax.set_xlabel("Trade")
-        fig.tight_layout()
-        fig.savefig(path)
-        plt.close(fig)
-        return path
-    except Exception as exc:
-        log.warning("Chart generation failed: %s", exc)
-        return None
-
-# --- END SECTION 14 ---
-
-# ==============================================================================
-# 15. INSTITUTIONAL ALERT TEMPLATES
-# ==============================================================================
-
-def build_institutional_alert(sig: Dict[str, Any],
-                                optimization: Optional[Dict[str, Any]] = None
-                                ) -> str:
-    decision = sig["decision"]
-    emoji = {"BUY": "🟢", "SELL": "🔴"}.get(decision, "⚪")
-    lines = [
-        f"{emoji} <b>{SYSTEM_NAME} v{VERSION}</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        f"<b>Symbol:</b> {sig['symbol']}",
-        f"<b>Decision:</b> {decision}",
-        f"<b>Confluence:</b> {sig['confluence']}",
-        f"<b>Quality:</b> ×{sig.get('quality_multiplier', 1.0)}",
-        "",
-        "<b>📐 Risk Levels</b>",
-        f"Entry: <code>{sig['entry']}</code>",
-        f"SL: <code>{sig['sl']}</code>",
-        f"TP1: <code>{sig['tp1']}</code>",
-        f"TP2: <code>{sig['tp2']}</code>",
-        f"TP3: <code>{sig['tp3']}</code>",
-        "",
-        "<b>💰 Risk Profile</b>",
-        f"Lots: {sig['lots']} | Risk USD: ${sig['risk_usd']}",
-        f"ATR: {sig['atr']:.4f} | Z: {sig['zscore']:+.2f}",
-        "",
-        "<b>🔬 Pillars</b>",
-    ]
-    for p in sig.get("pillars", []):
-        lines.append(f"• {p['name']:<10} {p['score']:>+7.2f}  ({p['detail']})")
-
-    lines += [
-        "",
-        f"<b>📡 Source:</b> {sig['source']}"
-        + (" ⚠️ degraded" if sig.get("degraded") else ""),
-    ]
-    if optimization:
-        lines += [
-            "<b>⚙️ Grid:</b> "
-            f"ATR={optimization.get('optimal_atr_period')} "
-            f"Z={optimization.get('optimal_z_threshold')}",
-            f"<b>PF:</b> {optimization.get('profit_factor')} | "
-            f"<b>WR:</b> {optimization.get('win_rate')}% | "
-            f"<b>Trades:</b> {optimization.get('trades')}",
-        ]
-    lines.append(f"<b>🕒</b> {sig['timestamp']}")
-    return "\n".join(lines)
-
-# --- END SECTION 15 ---
-
-# ==============================================================================
-# 16. MARKET CACHE
-# ==============================================================================
-
-class MarketCache:
-    def __init__(self, ttl: int = 60):
-        self.ttl = ttl
-        self.last_fetch: float = 0.0
-        self.cached: Optional[Tuple[pd.DataFrame, str, bool]] = None
-
-    def get(self, force: bool = False) -> Tuple[pd.DataFrame, str, bool]:
-        now = time.time()
-        if not force and self.cached and (now - self.last_fetch) < self.ttl:
-            return self.cached
-        t0 = time.time()
-        df, source, degraded = fetch_market_data()
-        latency = time.time() - t0
-        self.cached = (df, source, degraded)
-        self.last_fetch = now
-        log.info("Feed OK -> %s | rows=%d | latency=%.2fs | degraded=%s",
-                 source, len(df), latency, degraded)
-        return self.cached
-
-
-MARKET_CACHE = MarketCache(ttl=60)
-
-# --- END SECTION 16 ---
-
-# ==============================================================================
-# 17. TELEGRAM COMMANDS (2-WAY INTERACTIVE)
-# ==============================================================================
-
-def tg_register_commands() -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        return
-    commands = [
-        {"command": "check",  "description": "Live market analysis"},
-        {"command": "status", "description": "Open positions"},
-        {"command": "signal", "description": "Last signal"},
-        {"command": "help",   "description": "Show help"},
-    ]
-    http_post_backoff(tg_api("setMyCommands"),
-                      json_payload={"commands": commands},
-                      max_retries=1, label="tg_setcmds")
-
-
-def build_check_reply(sig: Dict[str, Any],
-                      optimization: Dict[str, Any]) -> str:
-    return (
-        f"🔍 <b>Live Check — {SYSTEM_NAME} v{VERSION}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Decision:</b> {sig['decision']}\n"
-        f"<b>Confluence:</b> {sig['confluence']}\n"
-        f"<b>Entry:</b> {sig['entry']}\n"
-        f"<b>SL:</b> {sig['sl']}\n"
-        f"<b>TPs:</b> {sig['tp1']} / {sig['tp2']} / {sig['tp3']}\n"
-        f"<b>ATR:</b> {sig['atr']:.4f} | <b>Z:</b> {sig['zscore']:+.2f}\n"
-        f"<b>Source:</b> {sig['source']}\n"
-        f"<b>Grid:</b> ATR={optimization.get('optimal_atr_period')} "
-        f"Z={optimization.get('optimal_z_threshold')}\n"
-        f"<b>PF:</b> {optimization.get('profit_factor')} | "
-        f"<b>WR:</b> {optimization.get('win_rate')}% | "
-        f"<b>Trades:</b> {optimization.get('trades')}"
-    )
-
-
-def build_status_reply(active: List[Dict[str, Any]]) -> str:
-    if not active:
-        return "📊 <b>Status:</b> No open positions."
-    lines = ["📊 <b>Active Positions:</b>", "━━━━━━━━━━━━━━━━━━━━━━"]
-    for p in active:
-        lines.append(
-            f"#{p['id']} <b>{p['direction']}</b> "
-            f"entry={p['entry']} sl={p['sl']} tp1_hit={p['tp1_hit']}")
-    return "\n".join(lines)
-
-
-def build_signal_reply(conn: sqlite3.Connection) -> str:
-    row = conn.execute(
-        "SELECT * FROM signals ORDER BY id DESC LIMIT 1").fetchone()
-    if not row:
-        return "📭 No signals recorded yet."
-    return (
-        f"📩 <b>Last Signal</b>\n"
-        f"<b>Time:</b> {row['ts']}\n"
-        f"<b>Decision:</b> {row['decision']}\n"
-        f"<b>Entry:</b> {row['entry']} | <b>SL:</b> {row['sl']}\n"
-        f"<b>TP1:</b> {row['tp1']} | <b>TP2:</b> {row['tp2']} | "
-        f"<b>TP3:</b> {row['tp3']}\n"
-        f"<b>Confluence:</b> {row['confluence']}"
-    )
-
-
-def build_help_reply() -> str:
-    return (
-        f"🤖 <b>{SYSTEM_NAME} v{VERSION}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"/check — live analysis\n"
-        f"/status — open positions\n"
-        f"/signal — last recorded signal\n"
-        f"/help — this message"
-    )
-
-
-def handle_update(conn: sqlite3.Connection, update: Dict[str, Any],
-                  engine: TrailingStopEngine) -> None:
-    msg = update.get("message") or {}
-    text = (msg.get("text") or "").strip()
-    chat_id = (msg.get("chat") or {}).get("id")
-    if not chat_id or not text:
-        return
-    cmd = text.split()[0].split("@")[0].lower()
-
-    try:
-        if cmd == "/check":
-            df, source, degraded = MARKET_CACHE.get(force=True)
-            opt = grid_search_optimize(df, conn=None)
-            sig = analyze_market(df, source, degraded, opt)
-            send_telegram_html(build_check_reply(sig, opt), chat_id=str(chat_id))
-        elif cmd == "/status":
-            send_telegram_html(build_status_reply(engine.active_positions()),
-                               chat_id=str(chat_id))
-        elif cmd == "/signal":
-            send_telegram_html(build_signal_reply(conn), chat_id=str(chat_id))
-        elif cmd in ("/help", "/start"):
-            send_telegram_html(build_help_reply(), chat_id=str(chat_id))
-    except Exception:
-        log.exception("Command handler failed for cmd=%s", cmd)
-        send_telegram_html("❌ Command failed — see logs.",
-                           chat_id=str(chat_id))
-
-
-def run_command_listener(conn: sqlite3.Connection, engine: TrailingStopEngine,
-                          budget_seconds: int = POLL_SECONDS) -> None:
-    """Long-poll Telegram for `budget_seconds`, dispatching commands."""
-    if not TELEGRAM_BOT_TOKEN:
-        log.warning("Listener skipped: TELEGRAM_BOT_TOKEN not set")
-        return
-
-    offset = int(get_state(conn, "tg_offset", "0") or "0")
-    deadline = time.time() + budget_seconds
-    log.info("Command listener active for %ds (offset=%d)",
-             budget_seconds, offset)
-
-    while time.time() < deadline:
-        try:
-            resp = requests.get(
-                tg_api("getUpdates"),
-                params={"offset": offset, "timeout": 25,
-                        "allowed_updates": '["message"]'},
-                timeout=30)
-            data = resp.json()
-            for update in data.get("result", []):
-                offset = int(update["update_id"]) + 1
-                set_state(conn, "tg_offset", str(offset))
-                handle_update(conn, update, engine)
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                if attempt < max_retries:
+                    delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after and retry_after.isdigit():
+                        delay = max(delay, int(retry_after))
+                    logger.warning(
+                        f"HTTP {resp.status_code} on {url}. Retrying in {delay}s "
+                        f"(attempt {attempt + 1}/{max_retries})..."
+                    )
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+            logger.error(
+                f"HTTP request failed permanently with status {resp.status_code}: {resp.text[:300]}"
+            )
+            return resp
         except requests.RequestException as exc:
-            log.warning("Poll transport failure: %s", exc)
-            time.sleep(2)
-        except Exception:
-            log.exception("Listener iteration failed")
-            time.sleep(2)
+            if attempt < max_retries:
+                delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+                logger.warning(
+                    f"Request exception ({exc.__class__.__name__}): {exc}. "
+                    f"Retrying in {delay}s (attempt {attempt + 1}/{max_retries})..."
+                )
+                time.sleep(delay)
+                attempt += 1
+            else:
+                logger.error(f"Request exhausted all {max_retries} retries: {exc}")
+                return None
+    return None
 
-# --- END SECTION 17 ---
 
-# ==============================================================================
-# 18. CYCLE ORCHESTRATION
-# ==============================================================================
+def send_telegram_message(
+    text: str,
+    chat_id: Optional[str] = None,
+    parse_mode: str = "HTML",
+) -> bool:
+    """Sends a formatted Telegram message using Exponential Backoff."""
+    target_chat = (chat_id or TELEGRAM_CHAT_ID).strip()
+    if not TELEGRAM_BOT_TOKEN or not target_chat:
+        logger.warning("Telegram credentials not configured; skipping Telegram delivery.")
+        return False
 
-def run_cycle(conn: sqlite3.Connection, engine: TrailingStopEngine,
-              *, mode: str = "once", no_notify: bool = False
-              ) -> Optional[Dict[str, Any]]:
-    open_ok, reason = session_governor()
-    if not open_ok:
-        log.info("Session closed: %s", reason)
-        forensic_audit_log(conn, "SESSION_CLOSED", {"reason": reason})
-        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": target_chat,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }
+    resp = request_with_exponential_backoff("POST", url, json=payload)
+    if resp is not None and resp.status_code == 200:
+        return True
+    return False
 
-    try:
-        df, source, degraded = MARKET_CACHE.get(force=True)
-    except Exception as exc:
-        log.error("Feed failure: %s", exc)
-        forensic_audit_log(conn, "FEED_FAILURE",
-                           {"error": str(exc)}, level="ERROR")
-        raise
 
-    optimization = grid_search_optimize(df, conn)
-    forensic_audit_log(conn, "GRID_SEARCH_COMPLETE", {
-        "optimal_atr_period": optimization["optimal_atr_period"],
-        "optimal_z_threshold": optimization["optimal_z_threshold"],
-        "profit_factor": optimization["profit_factor"],
-        "win_rate": optimization["win_rate"],
-        "trades": optimization["trades"],
-        "cells_evaluated": optimization["cells_evaluated"],
-    })
+def send_telegram_photo(
+    image_path: str,
+    caption: str = "",
+    chat_id: Optional[str] = None,
+) -> bool:
+    """Uploads an image artifact to Telegram using Exponential Backoff."""
+    target_chat = (chat_id or TELEGRAM_CHAT_ID).strip()
+    if not TELEGRAM_BOT_TOKEN or not target_chat or not os.path.exists(image_path):
+        return False
 
-    closed = engine.refresh(df)
-    if closed:
-        log.info("Trailing engine closed %d position(s)", len(closed))
-        forensic_audit_log(conn, "TRAILING_CLOSE", {"closed": closed})
-
-    sig = analyze_market(df, source, degraded, optimization)
-    forensic_audit_log(conn, "PILLAR_ANALYSIS", {
-        "decision": sig["decision"],
-        "confluence": sig["confluence"],
-        "pillars": sig["pillars"],
-    })
-
-    if sig["decision"] in ("BUY", "SELL"):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    attempt = 0
+    delays = (2, 4, 8)
+    while attempt <= 3:
         try:
-            sig["signal_id"] = persist_signal(conn, sig)
-            engine.register(sig)
-            log.info("Registered signal #%s (%s)",
-                     sig["signal_id"], sig["decision"])
-        except sqlite3.Error as exc:
-            log.error("Signal persistence failed: %s", exc)
+            with open(image_path, "rb") as img_file:
+                files = {"photo": img_file}
+                data = {"chat_id": target_chat, "caption": caption[:1024], "parse_mode": "HTML"}
+                resp = requests.post(url, data=data, files=files, timeout=20)
+            if resp.status_code == 200:
+                return True
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                if attempt < 3:
+                    time.sleep(delays[attempt])
+                    attempt += 1
+                    continue
+            logger.error(f"Telegram sendPhoto error {resp.status_code}: {resp.text[:200]}")
+            return False
+        except requests.RequestException as exc:
+            if attempt < 3:
+                time.sleep(delays[attempt])
+                attempt += 1
+            else:
+                logger.error(f"Telegram sendPhoto failed: {exc}")
+                return False
+    return False
 
-    should_notify = (
-        not no_notify
-        and (FORCE_NOTIFY
-             or sig["decision"] != "NEUTRAL"
-             or NOTIFY_NEUTRAL)
+
+def send_discord_webhook(report: SignalReport) -> bool:
+    """Sends a structured institutional embed to Discord using Exponential Backoff."""
+    if not DISCORD_WEBHOOK_URL:
+        logger.info("DISCORD_WEBHOOK_URL not configured; skipping Discord delivery.")
+        return False
+
+    if "BUY" in report.signal_decision:
+        color = 0x10B981
+    elif "SELL" in report.signal_decision:
+        color = 0xEF4444
+    else:
+        color = 0xF59E0B
+
+    embed = {
+        "title": f"APEX-QUANT-OMNI SOVEREIGN {ENGINE_VERSION} | {report.asset}",
+        "description": (
+            f"**Signal Decision:** `{report.signal_decision}`\n"
+            f"**Trailing Stop Protocol:** `{report.trailing_stop_protocol}`\n"
+            f"**Session Governor:** `{report.session_status.session_name}`"
+        ),
+        "color": color,
+        "fields": [
+            {"name": "Precision Entry", "value": f"`{report.entry_price:.2f}`", "inline": True},
+            {"name": "Forensic Stop Loss", "value": f"`{report.stop_loss:.2f}`", "inline": True},
+            {"name": "Confluence Score", "value": f"`{report.confluence_score}/100`", "inline": True},
+            {"name": "TP1 (1.5R)", "value": f"`{report.tp1:.2f}`", "inline": True},
+            {"name": "TP2 (2.5R)", "value": f"`{report.tp2:.2f}`", "inline": True},
+            {"name": "TP3 (4.0R)", "value": f"`{report.tp3:.2f}`", "inline": True},
+            {
+                "name": "Risk & Sizing",
+                "value": f"Lot: `{report.recommended_lot:.2f}` | Risk: `${report.risk_amount_usd:.2f}`",
+                "inline": True,
+            },
+            {
+                "name": "Grid Search Optimal",
+                "value": f"ATR: `{report.optimal_atr_period}` | Z: `{report.optimal_z_threshold:.1f}`",
+                "inline": True,
+            },
+            {
+                "name": "Backtest Metrics",
+                "value": (
+                    f"WR: `{report.win_rate:.1f}%` | PF: `{report.profit_factor:.2f}` | "
+                    f"MDD: `{report.max_drawdown:.1f}%`"
+                ),
+                "inline": True,
+            },
+        ],
+        "footer": {
+            "text": f"Feed: {report.data_source} | UTC: {report.timestamp_utc}"
+        },
+    }
+
+    payload = {"username": "APEX-QUANT-OMNI v75.0", "embeds": [embed]}
+    resp = request_with_exponential_backoff("POST", DISCORD_WEBHOOK_URL, json=payload)
+    return resp is not None and resp.status_code in (200, 204)
+
+
+def send_emergency_telegram_alert(context: str, error: Exception) -> None:
+    """Dispatches critical exception telemetry to Telegram so silent failures never occur."""
+    tb_snippet = traceback.format_exc()[-900:]
+    msg = (
+        f"🚨 <b>APEX-QUANT-OMNI {ENGINE_VERSION} — EMERGENCY EXCEPTION ALERT</b> 🚨\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ <b>Module:</b> {context}\n"
+        f"❌ <b>Error:</b> <code>{str(error)}</code>\n"
+        f"🕒 <b>UTC:</b> {datetime.now(timezone.utc).isoformat()}\n"
+        f"<pre>{tb_snippet}</pre>"
     )
-    if should_notify:
-        alert = build_institutional_alert(sig, optimization)
-        send_telegram_html(alert)
-        send_discord(alert)
+    send_telegram_message(msg)
 
-    if optimization.get("curve") and len(optimization["curve"]) >= 2:
-        path = plot_backtest(optimization["curve"])
-        if path:
-            log.info("Chart written -> %s", path)
-
-    forensic_audit_log(conn, "CYCLE_COMPLETE", {
-        "decision": sig["decision"],
-        "confluence": sig["confluence"],
-        "notified": should_notify,
-    })
-    return sig
-
-# --- END SECTION 18 ---
 
 # ==============================================================================
-# 19. MAIN ENTRYPOINT
+# SQLITE ARTIFACT PERSISTENCE & FORENSIC AUDIT LOGGER
 # ==============================================================================
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=f"{SYSTEM_NAME} v{VERSION} — XAUUSD Hybrid Signal Engine")
-    parser.add_argument(
-        "--mode", choices=["check", "once", "listen"], default="once",
-        help="check = dry-run printout; once = single cycle; listen = cycle + poll")
-    parser.add_argument(
-        "--no-notify", action="store_true",
-        help="Suppress Telegram/Discord delivery (stdout only)")
-    args = parser.parse_args()
-
-    conn = db_connect()
-    init_db(conn)
-    engine = TrailingStopEngine(conn)
-
+def init_sqlite_db(db_path: str = DB_PATH) -> None:
+    """Initializes the SQLite database schema for forensic audit, state, and trailing stops."""
+    conn = sqlite3.connect(db_path)
     try:
-        if args.mode == "check":
-            df, source, degraded = MARKET_CACHE.get(force=True)
-            optimization = grid_search_optimize(df, conn=None)
-            sig = analyze_market(df, source, degraded, optimization)
-            print(json.dumps({"signal": sig, "optimization": {
-                "atr_period": optimization["optimal_atr_period"],
-                "z_threshold": optimization["optimal_z_threshold"],
-                "profit_factor": optimization["profit_factor"],
-                "win_rate": optimization["win_rate"],
-                "trades": optimization["trades"],
-                "cells_evaluated": optimization["cells_evaluated"],
-            }}, indent=2, default=str))
-
-        elif args.mode == "once":
-            run_cycle(conn, engine, mode="once", no_notify=args.no_notify)
-
-        elif args.mode == "listen":
-            tg_register_commands()
-            run_cycle(conn, engine, mode="listen", no_notify=args.no_notify)
-            run_command_listener(conn, engine, budget_seconds=POLL_SECONDS)
-
-    except Exception:
-        tb = traceback.format_exc()
-        log.error("Fatal: %s", tb)
-        if not args.no_notify:
-            send_emergency_alert(tb)
-        sys.exit(1)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signals_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc TEXT NOT NULL,
+                candle_timestamp_utc TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                data_source TEXT NOT NULL,
+                session_name TEXT NOT NULL,
+                session_allowed INTEGER NOT NULL,
+                signal_decision TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                stop_loss REAL NOT NULL,
+                tp1 REAL NOT NULL,
+                tp2 REAL NOT NULL,
+                tp3 REAL NOT NULL,
+                trailing_stop_protocol TEXT NOT NULL,
+                confluence_score INTEGER NOT NULL,
+                z_score REAL NOT NULL,
+                smc_state TEXT NOT NULL,
+                order_flow_state TEXT NOT NULL,
+                mtf_harmony_state TEXT NOT NULL,
+                atr_value REAL NOT NULL,
+                optimal_atr_period INTEGER NOT NULL,
+                optimal_z_threshold REAL NOT NULL,
+                recommended_lot REAL NOT NULL,
+                risk_amount_usd REAL NOT NULL,
+                win_rate REAL NOT NULL,
+                profit_factor REAL NOT NULL,
+                max_drawdown REAL NOT NULL,
+                webhook_status TEXT NOT NULL,
+                raw_metrics_json TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS active_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                opened_utc TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                initial_sl REAL NOT NULL,
+                current_sl REAL NOT NULL,
+                tp1 REAL NOT NULL,
+                tp2 REAL NOT NULL,
+                tp3 REAL NOT NULL,
+                atr_at_entry REAL NOT NULL,
+                tp1_hit INTEGER NOT NULL DEFAULT 0,
+                peak_favorable_price REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                updated_utc TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
     finally:
         conn.close()
 
 
+def get_bot_state(key: str, default: str = "", db_path: str = DB_PATH) -> str:
+    init_sqlite_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM bot_state WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+    finally:
+        conn.close()
+
+
+def set_bot_state(key: str, value: str, db_path: str = DB_PATH) -> None:
+    init_sqlite_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def forensic_audit_log(report: SignalReport, db_path: str = DB_PATH) -> None:
+    """
+    Outputs raw quantitative metrics to console AND records the full signal
+    event into the local SQLite database (`trading_signals.db`).
+    """
+    init_sqlite_db(db_path)
+
+    raw_payload = {
+        "pillar_breakdown": report.pillar_breakdown,
+        "session": asdict(report.session_status),
+        "z_score": report.z_score,
+        "atr_value": report.atr_value,
+        "optimal_atr_period": report.optimal_atr_period,
+        "optimal_z_threshold": report.optimal_z_threshold,
+    }
+
+    logger.info("========== FORENSIC AUDIT LOG ==========")
+    logger.info(
+        f"Asset={report.asset} | Decision={report.signal_decision} | "
+        f"Score={report.confluence_score}/100 | Source={report.data_source}"
+    )
+    logger.info(
+        f"Entry={report.entry_price:.2f} | SL={report.stop_loss:.2f} | "
+        f"TP1={report.tp1:.2f} | TP2={report.tp2:.2f} | TP3={report.tp3:.2f}"
+    )
+    logger.info(
+        f"Z-Score={report.z_score:.4f} | ATR={report.atr_value:.4f} | "
+        f"SMC={report.smc_state} | OrderFlow={report.order_flow_state} | "
+        f"MTF={report.mtf_harmony_state}"
+    )
+    logger.info(
+        f"GridSearch(ATR={report.optimal_atr_period}, Z={report.optimal_z_threshold:.1f}) | "
+        f"WR={report.win_rate:.1f}% | PF={report.profit_factor:.2f} | MDD={report.max_drawdown:.1f}%"
+    )
+    logger.info(
+        f"Lot={report.recommended_lot:.2f} | RiskUSD=${report.risk_amount_usd:.2f} | "
+        f"Trailing={report.trailing_stop_protocol} | Webhook={report.webhook_status}"
+    )
+    logger.info("========================================")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO signals_audit (
+                timestamp_utc, candle_timestamp_utc, asset, data_source,
+                session_name, session_allowed, signal_decision, entry_price,
+                stop_loss, tp1, tp2, tp3, trailing_stop_protocol,
+                confluence_score, z_score, smc_state, order_flow_state,
+                mtf_harmony_state, atr_value, optimal_atr_period,
+                optimal_z_threshold, recommended_lot, risk_amount_usd,
+                win_rate, profit_factor, max_drawdown, webhook_status,
+                raw_metrics_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                report.timestamp_utc,
+                report.candle_timestamp_utc,
+                report.asset,
+                report.data_source,
+                report.session_status.session_name,
+                1 if report.session_status.is_allowed else 0,
+                report.signal_decision,
+                float(report.entry_price),
+                float(report.stop_loss),
+                float(report.tp1),
+                float(report.tp2),
+                float(report.tp3),
+                report.trailing_stop_protocol,
+                int(report.confluence_score),
+                float(report.z_score),
+                report.smc_state,
+                report.order_flow_state,
+                report.mtf_harmony_state,
+                float(report.atr_value),
+                int(report.optimal_atr_period),
+                float(report.optimal_z_threshold),
+                float(report.recommended_lot),
+                float(report.risk_amount_usd),
+                float(report.win_rate),
+                float(report.profit_factor),
+                float(report.max_drawdown),
+                report.webhook_status,
+                json.dumps(raw_payload),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ==============================================================================
+# MARKET SESSION GOVERNOR & TIMING SAFETY
+# ==============================================================================
+def evaluate_market_session(now_utc: Optional[datetime] = None) -> SessionStatus:
+    """
+    Verifies UTC time and day of week. Suppresses automated signal execution during:
+      - Weekend market closure (Fri >= 21:00 UTC through Sun < 22:00 UTC)
+      - Daily rollover window (21:00 - 22:00 UTC)
+      - Low-liquidity Asian open transition noise (22:00 - 23:00 UTC)
+    """
+    now = now_utc or datetime.now(timezone.utc)
+    weekday = now.weekday()  # 0=Mon ... 4=Fri, 5=Sat, 6=Sun
+    hour = now.hour
+    ts_str = now.isoformat()
+
+    # Weekend Closure Check
+    if weekday == 4 and hour >= 21:
+        return SessionStatus(
+            is_allowed=False,
+            session_name="WEEKEND_CLOSE_GUARD",
+            reason="Friday close window (>=21:00 UTC) suppressed to prevent weekend gap & wide spread slippage.",
+            utc_timestamp=ts_str,
+        )
+    if weekday == 5:
+        return SessionStatus(
+            is_allowed=False,
+            session_name="WEEKEND_CLOSED",
+            reason="Saturday spot gold market closed.",
+            utc_timestamp=ts_str,
+        )
+    if weekday == 6 and hour < 23:
+        return SessionStatus(
+            is_allowed=False,
+            session_name="SUNDAY_OPEN_GUARD",
+            reason="Sunday pre-open / illiquid initial open (<23:00 UTC) suppressed.",
+            utc_timestamp=ts_str,
+        )
+
+    # Daily Rollover (21:00 - 22:00 UTC) & Early Asian Open Noise (22:00 - 23:00 UTC)
+    if 21 <= hour < 22:
+        return SessionStatus(
+            is_allowed=False,
+            session_name="DAILY_ROLLOVER_GUARD",
+            reason="Daily FX/Gold rollover hour (21:00-22:00 UTC) suppressed due to spread expansion.",
+            utc_timestamp=ts_str,
+        )
+    if 22 <= hour < 23:
+        return SessionStatus(
+            is_allowed=False,
+            session_name="ASIAN_OPEN_NOISE_GUARD",
+            reason="Low-liquidity Asian open transition (22:00-23:00 UTC) suppressed.",
+            utc_timestamp=ts_str,
+        )
+
+    # Active Liquidity Sessions
+    if 0 <= hour < 7:
+        session_name = "ASIAN_SESSION_ACTIVE"
+    elif 7 <= hour < 12:
+        session_name = "LONDON_SESSION_PRIME"
+    elif 12 <= hour < 16:
+        session_name = "LONDON_NY_OVERLAP_PEAK"
+    else:
+        session_name = "NEW_YORK_SESSION_ACTIVE"
+
+    return SessionStatus(
+        is_allowed=True,
+        session_name=session_name,
+        reason="Active institutional liquidity window verified.",
+        utc_timestamp=ts_str,
+    )
+
+
+# ==============================================================================
+# MULTI-SOURCE FREE FALLBACK DATA PIPELINE (MT5 SPOT GOLD SYNC & FAILOVER)
+# ==============================================================================
+def _normalize_ohlcv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flattens yfinance MultiIndex columns, enforces float dtypes, normalizes UTC
+    DatetimeIndex, and applies EffectiveVolume safeguard when spot volume is 0.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    # MANDATORY SAFEGUARD: Flatten MultiIndex columns automatically
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df = df.loc[:, ~df.columns.duplicated()]
+    rename_map = {c: str(c).strip().title() for c in df.columns}
+    df.rename(columns=rename_map, inplace=True)
+
+    required = ["Open", "High", "Low", "Close"]
+    for col in required:
+        if col not in df.columns:
+            return pd.DataFrame()
+
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
+
+    df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    df["Volume"] = df["Volume"].fillna(0.0)
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, utc=True)
+    else:
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+
+    df.sort_index(inplace=True)
+    df = df[~df.index.duplicated(keep="last")]
+
+    # Spot Gold feeds on Yahoo often report 0 volume; construct range-based tick proxy
+    range_proxy = ((df["High"] - df["Low"]).abs() + (df["Close"] - df["Open"]).abs() + EPSILON) * 1000.0
+    df["EffectiveVolume"] = np.where(df["Volume"] > 0.0, df["Volume"], range_proxy)
+    return df
+
+
+def _fetch_from_yfinance(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    """Primary Feed: yfinance direct spot ticker XAUUSD=X."""
+    raw = yf.download(
+        tickers=ticker,
+        period=period,
+        interval=interval,
+        progress=False,
+        auto_adjust=False,
+        threads=False,
+    )
+    return _normalize_ohlcv_dataframe(raw)
+
+
+def _fetch_from_yahoo_chart_http(ticker: str, interval: str, range_str: str) -> pd.DataFrame:
+    """Secondary Feed: Direct Yahoo Finance v8 HTTP Chart API failover."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        url = f"https://{host}/v8/finance/chart/{ticker}"
+        params = {"interval": interval, "range": range_str, "includePrePost": "false"}
+        resp = request_with_exponential_backoff(
+            "GET", url, max_retries=2, backoff_delays=(2, 4), timeout=12, headers=headers, params=params
+        )
+        if resp is None or resp.status_code != 200:
+            continue
+        try:
+            payload = resp.json()
+            result = payload["chart"]["result"][0]
+            timestamps = result["timestamp"]
+            quote = result["indicators"]["quote"][0]
+            df = pd.DataFrame(
+                {
+                    "Open": quote["open"],
+                    "High": quote["high"],
+                    "Low": quote["low"],
+                    "Close": quote["close"],
+                    "Volume": quote.get("volume", [0.0] * len(timestamps)),
+                },
+                index=pd.to_datetime(timestamps, unit="s", utc=True),
+            )
+            normalized = _normalize_ohlcv_dataframe(df)
+            if len(normalized) >= 50:
+                return normalized
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            logger.warning(f"Yahoo v8 HTTP parse warning ({host}): {exc}")
+    return pd.DataFrame()
+
+
+def _fetch_swissquote_live_spot_mid() -> Optional[float]:
+    """Queries Swissquote free public BBO feed for live MT5-grade XAU/USD spot calibration."""
+    url = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
+    resp = request_with_exponential_backoff("GET", url, max_retries=1, backoff_delays=(2,), timeout=8)
+    if resp is None or resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+        if isinstance(data, list) and len(data) > 0:
+            spreads = data[0].get("spreadProfilePrices", [])
+            if spreads:
+                bid = float(spreads[0]["bid"])
+                ask = float(spreads[0]["ask"])
+                if bid > 100.0 and ask > 100.0:
+                    return (bid + ask) / 2.0
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+    return None
+
+
+def _fetch_from_binance_spot_gold(interval: str, limit: int = 1000) -> pd.DataFrame:
+    """
+    Tertiary Failover Feed: Binance Vision public spot gold-backed PAXGUSDT
+    1:1 troy oz benchmark, optionally calibrated to Swissquote XAU/USD spot mid.
+    """
+    url = "https://data-api.binance.vision/api/v3/klines"
+    params = {"symbol": "PAXGUSDT", "interval": interval, "limit": limit}
+    resp = request_with_exponential_backoff(
+        "GET", url, max_retries=2, backoff_delays=(2, 4), timeout=12, params=params
+    )
+    if resp is None or resp.status_code != 200:
+        return pd.DataFrame()
+    try:
+        rows = resp.json()
+        if not isinstance(rows, list) or len(rows) < 50:
+            return pd.DataFrame()
+        df = pd.DataFrame(
+            {
+                "Open": [float(r[1]) for r in rows],
+                "High": [float(r[2]) for r in rows],
+                "Low": [float(r[3]) for r in rows],
+                "Close": [float(r[4]) for r in rows],
+                "Volume": [float(r[5]) for r in rows],
+            },
+            index=pd.to_datetime([int(r[0]) for r in rows], unit="ms", utc=True),
+        )
+        normalized = _normalize_ohlcv_dataframe(df)
+        live_spot = _fetch_swissquote_live_spot_mid()
+        if live_spot and not normalized.empty:
+            last_close = float(normalized["Close"].iloc[-1])
+            basis_ratio = live_spot / (last_close + EPSILON)
+            if 0.95 <= basis_ratio <= 1.05:
+                for col in ("Open", "High", "Low", "Close"):
+                    normalized[col] = normalized[col] * basis_ratio
+        return normalized
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        logger.warning(f"Tertiary spot feed parse error: {exc}")
+        return pd.DataFrame()
+
+
+def fetch_xauusd_mtf_data() -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+    """
+    Fault-tolerant Multi-Source Data Ingestion for 15M execution and 1H macro data.
+    Sequentially queries Primary (yfinance XAUUSD=X), Secondary (Yahoo v8 HTTP Spot),
+    and Tertiary (Binance Vision Spot Gold + Swissquote BBO Calibration).
+    """
+    sources = [
+        (
+            "Nominal (Primary: yfinance XAUUSD=X)",
+            lambda: (
+                _fetch_from_yfinance(SYMBOL_PRIMARY, "15m", "30d"),
+                _fetch_from_yfinance(SYMBOL_PRIMARY, "1h", "60d"),
+            ),
+        ),
+        (
+            "Failover Active (Secondary: Yahoo v8 HTTP XAUUSD=X)",
+            lambda: (
+                _fetch_from_yahoo_chart_http(SYMBOL_PRIMARY, "15m", "1mo"),
+                _fetch_from_yahoo_chart_http(SYMBOL_PRIMARY, "1h", "3mo"),
+            ),
+        ),
+        (
+            "Failover Active (Tertiary: Spot PAXG/XAUUSD Calibrated)",
+            lambda: (
+                _fetch_from_binance_spot_gold("15m", 1000),
+                _fetch_from_binance_spot_gold("1h", 750),
+            ),
+        ),
+    ]
+
+    for source_label, loader in sources:
+        try:
+            df_15m, df_1h = loader()
+            if len(df_15m) >= 120 and len(df_1h) >= 60:
+                logger.info(
+                    f"Data ingestion succeeded via [{source_label}] | "
+                    f"15M bars={len(df_15m)} | 1H bars={len(df_1h)}"
+                )
+                return df_15m, df_1h, source_label
+            logger.warning(
+                f"Feed [{source_label}] returned insufficient bars "
+                f"(15M={len(df_15m)}, 1H={len(df_1h)}). Failing over..."
+            )
+        except Exception as exc:
+            logger.warning(f"Feed [{source_label}] raised exception: {exc}. Failing over...")
+
+    raise RuntimeError(
+        "CRITICAL DATA OUTAGE: All multi-source Spot Gold (XAUUSD) feeds failed."
+    )
+
+
+# ==============================================================================
+# TECHNICAL INDICATORS & 5-PILLAR HYBRID QUANTITATIVE ENGINE
+# ==============================================================================
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Computes Wilder-smoothed Average True Range with zero-division guard."""
+    high = df["High"]
+    low = df["Low"]
+    prev_close = df["Close"].shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = true_range.ewm(alpha=1.0 / max(period, 1), adjust=False).mean()
+    return atr.fillna(true_range).clip(lower=EPSILON)
+
+
+def compute_rolling_zscore(series: pd.Series, window: int = 20) -> pd.Series:
+    """Computes rolling Z-Score with mandatory epsilon protection against zero std."""
+    rolling_mean = series.rolling(window=window, min_periods=max(5, window // 2)).mean()
+    rolling_std = series.rolling(window=window, min_periods=max(5, window // 2)).std()
+    z_score = (series - rolling_mean) / (rolling_std + EPSILON)
+    return z_score.fillna(0.0)
+
+
+def analyze_pillar_1_smc(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]:
+    """
+    Pillar I (Smart Money Concepts):
+    Detects confirmed Swing Highs / Swing Lows (fractal k=3), Break of Structure (BOS),
+    and Change of Character (ChoCh). Returns directional score [-25, +25] and state.
+    """
+    sub = df.tail(lookback).copy()
+    highs = sub["High"].values
+    lows = sub["Low"].values
+    closes = sub["Close"].values
+    n = len(sub)
+
+    swing_highs: List[Tuple[int, float]] = []
+    swing_lows: List[Tuple[int, float]] = []
+    k = 3
+    for i in range(k, n - k):
+        if highs[i] == np.max(highs[i - k : i + k + 1]):
+            swing_highs.append((i, float(highs[i])))
+        if lows[i] == np.min(lows[i - k : i + k + 1]):
+            swing_lows.append((i, float(lows[i])))
+
+    last_close = float(closes[-1])
+    prev_close = float(closes[-2]) if n >= 2 else last_close
+
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return {"bias": "NEUTRAL", "points": 8, "state": "SMC_CONSOLIDATION", "event": "NONE"}
+
+    sh_prev, sh_last = swing_highs[-2][1], swing_highs[-1][1]
+    sl_prev, sl_last = swing_lows[-2][1], swing_lows[-1][1]
+
+    higher_highs = sh_last > sh_prev
+    higher_lows = sl_last > sl_prev
+    lower_highs = sh_last < sh_prev
+    lower_lows = sl_last < sl_prev
+
+    bull_bos = last_close > sh_last and prev_close <= sh_last
+    bear_bos = last_close < sl_last and prev_close >= sl_last
+    bull_choch = lower_lows and last_close > sh_last
+    bear_choch = higher_highs and last_close < sl_last
+
+    if bull_choch:
+        return {"bias": "BULLISH", "points": 25, "state": "BULLISH_CHOCH_REVERSAL", "event": "CHOCH_UP"}
+    if bear_choch:
+        return {"bias": "BEARISH", "points": 25, "state": "BEARISH_CHOCH_REVERSAL", "event": "CHOCH_DOWN"}
+    if bull_bos or (higher_highs and higher_lows and last_close > sl_last):
+        pts = 24 if bull_bos else 19
+        ev = "BOS_UP" if bull_bos else "HH_HL_STRUCTURE"
+        return {"bias": "BULLISH", "points": pts, "state": f"BULLISH_{ev}", "event": ev}
+    if bear_bos or (lower_highs and lower_lows and last_close < sh_last):
+        pts = 24 if bear_bos else 19
+        ev = "BOS_DOWN" if bear_bos else "LH_LL_STRUCTURE"
+        return {"bias": "BEARISH", "points": pts, "state": f"BEARISH_{ev}", "event": ev}
+
+    if last_close > (sh_last + sl_last) / 2.0:
+        return {"bias": "BULLISH", "points": 12, "state": "UPPER_RANGE_PREMIUM", "event": "RANGE_BULL"}
+    return {"bias": "BEARISH", "points": 12, "state": "LOWER_RANGE_DISCOUNT", "event": "RANGE_BEAR"}
+
+
+def analyze_pillar_2_order_flow(df: pd.DataFrame, window: int = 10) -> Dict[str, Any]:
+    """
+    Pillar II (Order Flow):
+    Computes volume-weighted body-to-wick ratios and directional pressure delta
+    over the recent institutional execution window. Returns max 20 points.
+    """
+    sub = df.tail(window).copy()
+    body = sub["Close"] - sub["Open"]
+    abs_body = body.abs()
+    upper_wick = sub["High"] - sub[["Open", "Close"]].max(axis=1)
+    lower_wick = sub[["Open", "Close"]].min(axis=1) - sub["Low"]
+    total_range = (sub["High"] - sub["Low"]).clip(lower=EPSILON)
+
+    vol = sub["EffectiveVolume"]
+    vol_weights = vol / (vol.sum() + EPSILON)
+
+    # Positive when bullish body + lower wick rejection dominate; negative when bearish + upper wick rejection dominate
+    bar_pressure = (body + 0.5 * (lower_wick - upper_wick)) / (total_range + EPSILON)
+    vw_pressure = float((bar_pressure * vol_weights).sum())
+    body_efficiency = float(((abs_body / (total_range + EPSILON)) * vol_weights).sum())
+
+    if vw_pressure > 0.15:
+        pts = min(20, int(12 + vw_pressure * 14 + body_efficiency * 4))
+        return {
+            "bias": "BULLISH",
+            "points": pts,
+            "state": f"BULL_IMBALANCE ({vw_pressure:+.2f})",
+            "vw_pressure": vw_pressure,
+        }
+    if vw_pressure < -0.15:
+        pts = min(20, int(12 + abs(vw_pressure) * 14 + body_efficiency * 4))
+        return {
+            "bias": "BEARISH",
+            "points": pts,
+            "state": f"BEAR_IMBALANCE ({vw_pressure:+.2f})",
+            "vw_pressure": vw_pressure,
+        }
+    return {
+        "bias": "NEUTRAL",
+        "points": 8,
+        "state": f"BALANCED_ABSORPTION ({vw_pressure:+.2f})",
+        "vw_pressure": vw_pressure,
+    }
+
+
+def analyze_pillar_3_zscore(
+    df: pd.DataFrame,
+    z_threshold: float,
+    window: int = 20,
+) -> Dict[str, Any]:
+    """
+    Pillar III (Z-Score Mean Reversion & Statistical Regime):
+    Evaluates rolling Z-Score with division-by-zero protection against optimal threshold.
+    Captures oversold mean-reversion longs / overbought mean-reversion shorts, as well
+    as healthy momentum pullbacks. Max 20 points.
+    """
+    z_series = compute_rolling_zscore(df["Close"], window=window)
+    z_now = float(z_series.iloc[-1])
+    z_prev = float(z_series.iloc[-2]) if len(z_series) >= 2 else z_now
+
+    if z_now <= -z_threshold:
+        # Deep statistical discount turning up -> strong bullish mean reversion
+        pts = 20 if z_now > z_prev else 17
+        return {"bias": "BULLISH", "points": pts, "z_score": z_now, "state": "OVERSOLD_REVERSION"}
+    if z_now >= z_threshold:
+        # Deep statistical premium turning down -> strong bearish mean reversion
+        pts = 20 if z_now < z_prev else 17
+        return {"bias": "BEARISH", "points": pts, "z_score": z_now, "state": "OVERBOUGHT_REVERSION"}
+    if -z_threshold < z_now <= -0.5 and z_now > z_prev:
+        return {"bias": "BULLISH", "points": 15, "z_score": z_now, "state": "DISCOUNT_RECOVERY"}
+    if 0.5 <= z_now < z_threshold and z_now < z_prev:
+        return {"bias": "BEARISH", "points": 15, "z_score": z_now, "state": "PREMIUM_FADE"}
+    if z_now > 0.0:
+        return {"bias": "BULLISH", "points": 10, "z_score": z_now, "state": "POSITIVE_DRIFT"}
+    return {"bias": "BEARISH", "points": 10, "z_score": z_now, "state": "NEGATIVE_DRIFT"}
+
+
+def analyze_pillar_4_mtf_harmony(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Pillar IV (Multi-Timeframe Fractal Harmony):
+    Synchronizes 1-Hour macro trend (EMA 20/50 + 1H SMC) with 15-Minute execution flow.
+    Max 20 points.
+    """
+    ema20_1h = df_1h["Close"].ewm(span=20, adjust=False).mean()
+    ema50_1h = df_1h["Close"].ewm(span=50, adjust=False).mean()
+    ema20_15m = df_15m["Close"].ewm(span=20, adjust=False).mean()
+    ema50_15m = df_15m["Close"].ewm(span=50, adjust=False).mean()
+
+    macro_bull = float(ema20_1h.iloc[-1]) > float(ema50_1h.iloc[-1]) and float(df_1h["Close"].iloc[-1]) > float(ema20_1h.iloc[-1])
+    macro_bear = float(ema20_1h.iloc[-1]) < float(ema50_1h.iloc[-1]) and float(df_1h["Close"].iloc[-1]) < float(ema20_1h.iloc[-1])
+
+    exec_bull = float(ema20_15m.iloc[-1]) > float(ema50_15m.iloc[-1])
+    exec_bear = float(ema20_15m.iloc[-1]) < float(ema50_15m.iloc[-1])
+
+    smc_1h = analyze_pillar_1_smc(df_1h, lookback=60)
+
+    if macro_bull and exec_bull and smc_1h["bias"] == "BULLISH":
+        return {"bias": "BULLISH", "points": 20, "state": "1H_15M_FULL_BULL_HARMONY"}
+    if macro_bear and exec_bear and smc_1h["bias"] == "BEARISH":
+        return {"bias": "BEARISH", "points": 20, "state": "1H_15M_FULL_BEAR_HARMONY"}
+    if (macro_bull and exec_bull) or (smc_1h["bias"] == "BULLISH" and exec_bull):
+        return {"bias": "BULLISH", "points": 15, "state": "1H_15M_PARTIAL_BULL_ALIGN"}
+    if (macro_bear and exec_bear) or (smc_1h["bias"] == "BEARISH" and exec_bear):
+        return {"bias": "BEARISH", "points": 15, "state": "1H_15M_PARTIAL_BEAR_ALIGN"}
+
+    return {"bias": "NEUTRAL", "points": 6, "state": "MTF_DIVERGENCE"}
+
+
+def analyze_pillar_5_atr_risk(
+    df_15m: pd.DataFrame,
+    direction: str,
+    optimal_atr_period: int,
+    account_balance: float = DEFAULT_ACCOUNT_BALANCE,
+    risk_percent: float = DEFAULT_RISK_PERCENT,
+) -> Dict[str, Any]:
+    """
+    Pillar V (ATR Risk & Dynamic Sizing):
+    Uses ATR(14) baseline blended with Grid Search optimal ATR period to compute
+    forensic Stop Loss, TP1 (1.5R), TP2 (2.5R), TP3 (4.0R, ensuring min RRR >= 1:3),
+    and dynamic XAUUSD position sizing. Max 15 points.
+    """
+    atr_14 = float(compute_atr(df_15m, period=14).iloc[-1])
+    atr_opt = float(compute_atr(df_15m, period=optimal_atr_period).iloc[-1])
+    atr_exec = (atr_14 + atr_opt) / 2.0
+    entry = float(df_15m["Close"].iloc[-1])
+
+    # Volatility sanity check: avoid dead flat tape or extreme spike (> 3.5x median ATR)
+    atr_series = compute_atr(df_15m, period=14)
+    median_atr = float(atr_series.tail(100).median()) + EPSILON
+    vol_ratio = atr_14 / median_atr
+
+    risk_dist = max(atr_exec * 1.5, 1.50)  # Minimum $1.50 spot distance guard
+    if direction == "BEARISH":
+        sl = entry + risk_dist
+        tp1 = entry - (1.5 * risk_dist)
+        tp2 = entry - (2.5 * risk_dist)
+        tp3 = entry - (4.0 * risk_dist)
+    else:
+        sl = entry - risk_dist
+        tp1 = entry + (1.5 * risk_dist)
+        tp2 = entry + (2.5 * risk_dist)
+        tp3 = entry + (4.0 * risk_dist)
+
+    risk_usd = account_balance * (risk_percent / 100.0)
+    raw_lots = risk_usd / ((risk_dist + EPSILON) * CONTRACT_OUNCES_PER_LOT)
+    recommended_lot = round(min(MAX_LOT_SIZE, max(MIN_LOT_SIZE, raw_lots)), 2)
+
+    if 0.6 <= vol_ratio <= 2.2:
+        pts = 15
+        vol_state = "OPTIMAL_ATR_REGIME"
+    elif 0.35 <= vol_ratio <= 3.0:
+        pts = 11
+        vol_state = "MODERATE_ATR_REGIME"
+    else:
+        pts = 5
+        vol_state = "EXTREME_VOLATILITY_GUARD"
+
+    return {
+        "entry": round(entry, 2),
+        "sl": round(sl, 2),
+        "tp1": round(tp1, 2),
+        "tp2": round(tp2, 2),
+        "tp3": round(tp3, 2),
+        "atr_14": round(atr_14, 4),
+        "atr_exec": round(atr_exec, 4),
+        "risk_distance": round(risk_dist, 2),
+        "recommended_lot": recommended_lot,
+        "risk_amount_usd": round(risk_usd, 2),
+        "points": pts,
+        "vol_state": vol_state,
+    }
+
+
+# ==============================================================================
+# GRID SEARCH PARAMETER OPTIMIZATION & HISTORICAL BACKTESTER
+# ==============================================================================
+def _simulate_strategy_backtest(
+    df_15m: pd.DataFrame,
+    df_1h: pd.DataFrame,
+    atr_period: int,
+    z_threshold: float,
+    initial_capital: float = DEFAULT_ACCOUNT_BALANCE,
+    risk_pct: float = DEFAULT_RISK_PERCENT,
+) -> GridSearchResult:
+    """
+    Runs a fast historical simulation with TP1 Breakeven Auto-Trailing Stop
+    to score an (atr_period, z_threshold) pair.
+    """
+    df = df_15m.copy()
+    df["ATR"] = compute_atr(df, period=atr_period)
+    df["Z"] = compute_rolling_zscore(df["Close"], window=20)
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+
+    # Align 1H macro trend onto 15M bars without lookahead bias
+    h1 = df_1h[["Close"]].copy()
+    h1["H1_EMA20"] = h1["Close"].ewm(span=20, adjust=False).mean()
+    h1["H1_EMA50"] = h1["Close"].ewm(span=50, adjust=False).mean()
+    h1["H1_BIAS"] = np.where(h1["H1_EMA20"] > h1["H1_EMA50"], 1, -1)
+    h1_shifted = h1[["H1_BIAS"]].shift(1).reindex(df.index, method="ffill").fillna(0)
+    df["H1_BIAS"] = h1_shifted["H1_BIAS"]
+
+    # Order flow proxy
+    total_range = (df["High"] - df["Low"]).clip(lower=EPSILON)
+    df["BAR_FLOW"] = (df["Close"] - df["Open"]) / total_range
+
+    equity = initial_capital
+    peak_equity = initial_capital
+    max_drawdown_pct = 0.0
+    equity_curve: List[float] = [initial_capital]
+    timestamps: List[pd.Timestamp] = [df.index[0]]
+    trade_log: List[Dict[str, Any]] = []
+
+    gross_profit = 0.0
+    gross_loss = 0.0
+    wins = 0
+    losses = 0
+
+    in_pos = False
+    pos_dir = 0
+    entry_p = 0.0
+    sl_p = 0.0
+    tp1_p = 0.0
+    tp2_p = 0.0
+    tp3_p = 0.0
+    tp1_reached = False
+    pos_atr = 1.0
+    risk_usd = 0.0
+    entry_time: Optional[pd.Timestamp] = None
+
+    opens = df["Open"].values
+    highs = df["High"].values
+    lows = df["Low"].values
+    closes = df["Close"].values
+    atrs = df["ATR"].values
+    zs = df["Z"].values
+    ema20s = df["EMA20"].values
+    ema50s = df["EMA50"].values
+    h1_biases = df["H1_BIAS"].values
+    flows = df["BAR_FLOW"].values
+    idx_list = df.index
+
+    start_bar = max(60, atr_period + 5)
+    for i in range(start_bar, len(df)):
+        if in_pos:
+            # Evaluate intrabar high/low against SL & TPs with TP1 Breakeven + ATR Trailing
+            closed_r = None
+            exit_p = closes[i]
+
+            if pos_dir == 1:
+                if lows[i] <= sl_p:
+                    closed_r = (sl_p - entry_p) / (abs(entry_p - (entry_p - 1.5 * pos_atr)) + EPSILON)
+                    exit_p = sl_p
+                elif highs[i] >= tp3_p:
+                    closed_r = 4.0
+                    exit_p = tp3_p
+                else:
+                    if not tp1_reached and highs[i] >= tp1_p:
+                        tp1_reached = True
+                        sl_p = max(sl_p, entry_p)  # Shift SL to Breakeven
+                    if tp1_reached:
+                        # Fractional ATR trailing step once TP1 breached
+                        trail_candidate = highs[i] - (1.0 * pos_atr)
+                        if highs[i] >= tp2_p:
+                            trail_candidate = max(trail_candidate, tp1_p)
+                        sl_p = max(sl_p, trail_candidate)
+            else:
+                if highs[i] >= sl_p:
+                    closed_r = (entry_p - sl_p) / (abs((entry_p + 1.5 * pos_atr) - entry_p) + EPSILON)
+                    exit_p = sl_p
+                elif lows[i] <= tp3_p:
+                    closed_r = 4.0
+                    exit_p = tp3_p
+                else:
+                    if not tp1_reached and lows[i] <= tp1_p:
+                        tp1_reached = True
+                        sl_p = min(sl_p, entry_p)  # Shift SL to Breakeven
+                    if tp1_reached:
+                        trail_candidate = lows[i] + (1.0 * pos_atr)
+                        if lows[i] <= tp2_p:
+                            trail_candidate = min(trail_candidate, tp1_p)
+                        sl_p = min(sl_p, trail_candidate)
+
+            if closed_r is not None:
+                pnl = risk_usd * closed_r
+                equity += pnl
+                if pnl >= 0:
+                    gross_profit += pnl
+                    wins += 1
+                else:
+                    gross_loss += abs(pnl)
+                    losses += 1
+                peak_equity = max(peak_equity, equity)
+                dd_pct = ((peak_equity - equity) / (peak_equity + EPSILON)) * 100.0
+                max_drawdown_pct = max(max_drawdown_pct, dd_pct)
+                equity_curve.append(equity)
+                timestamps.append(idx_list[i])
+                trade_log.append(
+                    {
+                        "entry_time": str(entry_time),
+                        "exit_time": str(idx_list[i]),
+                        "direction": "BUY" if pos_dir == 1 else "SELL",
+                        "entry": round(entry_p, 2),
+                        "exit": round(exit_p, 2),
+                        "r_multiple": round(closed_r, 2),
+                        "pnl_usd": round(pnl, 2),
+                    }
+                )
+                in_pos = False
+                continue
+
+        else:
+            # Session check on bar timestamp
+            bar_dt = idx_list[i].to_pydatetime()
+            if 21 <= bar_dt.hour < 23:
+                continue
+
+            z_val = zs[i]
+            z_prev = zs[i - 1]
+            c_val = closes[i]
+            atr_val = max(atrs[i], 0.5)
+            bull_trend = ema20s[i] > ema50s[i] and h1_biases[i] >= 0
+            bear_trend = ema20s[i] < ema50s[i] and h1_biases[i] <= 0
+
+            bull_signal = (
+                (z_val <= -z_threshold or (z_val < -0.6 and z_val > z_prev and bull_trend))
+                and flows[i] > 0.1
+                and c_val > opens[i]
+            )
+            bear_signal = (
+                (z_val >= z_threshold or (z_val > 0.6 and z_val < z_prev and bear_trend))
+                and flows[i] < -0.1
+                and c_val < opens[i]
+            )
+
+            if bull_signal and not bear_signal:
+                in_pos = True
+                pos_dir = 1
+                entry_p = c_val
+                pos_atr = atr_val
+                risk_dist = max(1.5 * pos_atr, 1.50)
+                sl_p = entry_p - risk_dist
+                tp1_p = entry_p + 1.5 * risk_dist
+                tp2_p = entry_p + 2.5 * risk_dist
+                tp3_p = entry_p + 4.0 * risk_dist
+                tp1_reached = False
+                risk_usd = equity * (risk_pct / 100.0)
+                entry_time = idx_list[i]
+            elif bear_signal and not bull_signal:
+                in_pos = True
+                pos_dir = -1
+                entry_p = c_val
+                pos_atr = atr_val
+                risk_dist = max(1.5 * pos_atr, 1.50)
+                sl_p = entry_p + risk_dist
+                tp1_p = entry_p - 1.5 * risk_dist
+                tp2_p = entry_p - 2.5 * risk_dist
+                tp3_p = entry_p - 4.0 * risk_dist
+                tp1_reached = False
+                risk_usd = equity * (risk_pct / 100.0)
+                entry_time = idx_list[i]
+
+    total_trades = wins + losses
+    win_rate = (wins / (total_trades + EPSILON)) * 100.0 if total_trades > 0 else 0.0
+    if total_trades == 0:
+        profit_factor = 0.0
+    elif gross_loss < 1e-6:
+        profit_factor = min(9.99, gross_profit / (1.0 + EPSILON)) if gross_profit > 0 else 0.0
+    else:
+        profit_factor = gross_profit / (gross_loss + EPSILON)
+
+    net_ret = ((equity - initial_capital) / (initial_capital + EPSILON)) * 100.0
+
+    return GridSearchResult(
+        optimal_atr_period=atr_period,
+        optimal_z_threshold=z_threshold,
+        win_rate=round(win_rate, 1),
+        profit_factor=round(profit_factor, 2),
+        max_drawdown=round(max_drawdown_pct, 2),
+        total_trades=total_trades,
+        net_return_pct=round(net_ret, 2),
+        equity_curve=equity_curve,
+        timestamps=timestamps,
+        trade_log=trade_log,
+    )
+
+
+def run_grid_search_optimization(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> GridSearchResult:
+    """
+    Programmatically evaluates all combinations in ATR_PERIOD_GRID x Z_THRESHOLD_GRID
+    to select the optimal combination yielding the highest Profit Factor.
+    """
+    candidates: List[GridSearchResult] = []
+    for atr_p in ATR_PERIOD_GRID:
+        for z_thresh in Z_THRESHOLD_GRID:
+            res = _simulate_strategy_backtest(df_15m, df_1h, atr_p, z_thresh)
+            candidates.append(res)
+
+    # Prefer combinations with >= 5 trades; fallback to any candidate if sample is small
+    viable = [c for c in candidates if c.total_trades >= 5]
+    pool = viable if viable else candidates
+
+    best = max(
+        pool,
+        key=lambda c: (c.profit_factor, c.win_rate, -c.max_drawdown, c.net_return_pct),
+    )
+    logger.info(
+        f"Grid Search Optimal Selected: ATR={best.optimal_atr_period}, "
+        f"Z={best.optimal_z_threshold:.1f} | Trades={best.total_trades} | "
+        f"WR={best.win_rate:.1f}% | PF={best.profit_factor:.2f} | MDD={best.max_drawdown:.1f}%"
+    )
+    return best
+
+
+# ==============================================================================
+# MATPLOTLIB BACKTEST CHART GENERATION (HEADLESS AGG)
+# ==============================================================================
+def generate_backtest_chart(
+    df_15m: pd.DataFrame,
+    grid_res: GridSearchResult,
+    chart_path: str = CHART_PATH,
+) -> str:
+    """
+    Renders institutional multi-panel backtest performance chart safely on headless
+    Linux runners via Agg backend and saves to `backtest_performance.png`.
+    """
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(12, 7.5), gridspec_kw={"height_ratios": [2.2, 1.0]}, facecolor="#0B0F19"
+    )
+
+    # Panel 1: Equity Curve
+    ax1.set_facecolor("#111827")
+    eq_times = pd.to_datetime(grid_res.timestamps)
+    eq_vals = np.array(grid_res.equity_curve, dtype=float)
+    ax1.plot(eq_times, eq_vals, color="#10B981", linewidth=2.2, label="Simulated Equity ($)")
+    ax1.fill_between(eq_times, eq_vals, eq_vals.min() * 0.995, color="#10B981", alpha=0.14)
+    ax1.axhline(DEFAULT_ACCOUNT_BALANCE, color="#6B7280", linestyle="--", linewidth=1.0, alpha=0.7)
+
+    ax1.set_title(
+        f"APEX-QUANT-OMNI {ENGINE_VERSION} | XAUUSD Grid-Optimized Equity Curve\n"
+        f"Optimal ATR={grid_res.optimal_atr_period} | Z-Thresh={grid_res.optimal_z_threshold:.1f} | "
+        f"Win Rate={grid_res.win_rate:.1f}% | Profit Factor={grid_res.profit_factor:.2f} | "
+        f"Max DD={grid_res.max_drawdown:.1f}%",
+        color="#F9FAFB",
+        fontsize=11,
+        fontweight="bold",
+        pad=12,
+    )
+    ax1.set_ylabel("Account Equity (USD)", color="#D1D5DB", fontsize=10)
+    ax1.tick_params(colors="#9CA3AF", labelsize=9)
+    ax1.grid(True, color="#1F2937", linestyle=":", linewidth=0.8)
+    ax1.legend(loc="upper left", facecolor="#1F2937", edgecolor="#374151", labelcolor="#F9FAFB")
+
+    # Panel 2: Rolling Z-Score & Threshold Bands
+    ax2.set_facecolor("#111827")
+    z_tail = compute_rolling_zscore(df_15m["Close"], window=20).tail(250)
+    ax2.plot(z_tail.index, z_tail.values, color="#38BDF8", linewidth=1.5, label="Rolling Z-Score (20)")
+    ax2.axhline(
+        grid_res.optimal_z_threshold,
+        color="#EF4444",
+        linestyle="--",
+        linewidth=1.1,
+        label=f"+Z Threshold ({grid_res.optimal_z_threshold:.1f})",
+    )
+    ax2.axhline(
+        -grid_res.optimal_z_threshold,
+        color="#10B981",
+        linestyle="--",
+        linewidth=1.1,
+        label=f"-Z Threshold (-{grid_res.optimal_z_threshold:.1f})",
+    )
+    ax2.axhline(0.0, color="#6B7280", linestyle="-", linewidth=0.7, alpha=0.6)
+    ax2.set_ylabel("Z-Score", color="#D1D5DB", fontsize=10)
+    ax2.tick_params(colors="#9CA3AF", labelsize=9)
+    ax2.grid(True, color="#1F2937", linestyle=":", linewidth=0.8)
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    ax2.legend(loc="upper left", ncol=3, facecolor="#1F2937", edgecolor="#374151", labelcolor="#F9FAFB", fontsize=8)
+
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig(chart_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    logger.info(f"Saved backtest performance chart to [{chart_path}].")
+    return chart_path
+
+
+# ==============================================================================
+# AUTO-TRAILING STOP ENGINE (LIVE SQLITE STATE MACHINE)
+# ==============================================================================
+def update_auto_trailing_stop_engine(
+    current_price: float,
+    current_atr: float,
+    new_signal_decision: str,
+    entry_price: float,
+    sl: float,
+    tp1: float,
+    tp2: float,
+    tp3: float,
+    db_path: str = DB_PATH,
+) -> str:
+    """
+    Monitors active open positions in SQLite. Once price breaches TP1, shifts
+    Stop Loss to Breakeven and engages fractional ATR trailing steps.
+    """
+    init_sqlite_db(db_path)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(db_path)
+    protocol_status = "Active @ TP1 Breakeven"
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, direction, entry_price, current_sl, tp1, tp2, tp3, atr_at_entry, tp1_hit, peak_favorable_price "
+            "FROM active_positions WHERE status = 'OPEN' ORDER BY id DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+
+        if row:
+            pos_id, direction, pos_entry, curr_sl, pos_tp1, pos_tp2, pos_tp3, pos_atr, tp1_hit, peak_fav = row
+            atr_step = max(0.5 * max(current_atr, pos_atr), 0.50)
+
+            if direction == "BUY":
+                peak_fav = max(peak_fav, current_price)
+                if current_price <= curr_sl:
+                    cur.execute(
+                        "UPDATE active_positions SET status = 'CLOSED_SL', updated_utc = ? WHERE id = ?",
+                        (now_iso, pos_id),
+                    )
+                    protocol_status = f"Prior BUY Closed @ SL {curr_sl:.2f} | Ready @ TP1 Breakeven"
+                elif current_price >= pos_tp3:
+                    cur.execute(
+                        "UPDATE active_positions SET status = 'CLOSED_TP3', updated_utc = ? WHERE id = ?",
+                        (now_iso, pos_id),
+                    )
+                    protocol_status = f"Prior BUY Hit TP3 {pos_tp3:.2f} (4.0R)"
+                else:
+                    if current_price >= pos_tp1 and tp1_hit == 0:
+                        tp1_hit = 1
+                        curr_sl = max(curr_sl, pos_entry)
+                    if tp1_hit == 1:
+                        new_trail = max(pos_entry, peak_fav - atr_step)
+                        if new_trail > curr_sl:
+                            curr_sl = round(new_trail, 2)
+                        protocol_status = f"Breakeven+ATR Trailing Active (SL @ {curr_sl:.2f})"
+                    cur.execute(
+                        "UPDATE active_positions SET current_sl = ?, tp1_hit = ?, peak_favorable_price = ?, updated_utc = ? WHERE id = ?",
+                        (curr_sl, tp1_hit, peak_fav, now_iso, pos_id),
+                    )
+            else:
+                peak_fav = min(peak_fav, current_price)
+                if current_price >= curr_sl:
+                    cur.execute(
+                        "UPDATE active_positions SET status = 'CLOSED_SL', updated_utc = ? WHERE id = ?",
+                        (now_iso, pos_id),
+                    )
+                    protocol_status = f"Prior SELL Closed @ SL {curr_sl:.2f} | Ready @ TP1 Breakeven"
+                elif current_price <= pos_tp3:
+                    cur.execute(
+                        "UPDATE active_positions SET status = 'CLOSED_TP3', updated_utc = ? WHERE id = ?",
+                        (now_iso, pos_id),
+                    )
+                    protocol_status = f"Prior SELL Hit TP3 {pos_tp3:.2f} (4.0R)"
+                else:
+                    if current_price <= pos_tp1 and tp1_hit == 0:
+                        tp1_hit = 1
+                        curr_sl = min(curr_sl, pos_entry)
+                    if tp1_hit == 1:
+                        new_trail = min(pos_entry, peak_fav + atr_step)
+                        if new_trail < curr_sl:
+                            curr_sl = round(new_trail, 2)
+                        protocol_status = f"Breakeven+ATR Trailing Active (SL @ {curr_sl:.2f})"
+                    cur.execute(
+                        "UPDATE active_positions SET current_sl = ?, tp1_hit = ?, peak_favorable_price = ?, updated_utc = ? WHERE id = ?",
+                        (curr_sl, tp1_hit, peak_fav, now_iso, pos_id),
+                    )
+
+        # Register new position if a fresh verified signal fires and no identical open direction exists
+        if "VERIFIED" in new_signal_decision:
+            new_dir = "BUY" if "BUY" in new_signal_decision else "SELL"
+            cur.execute("SELECT id, direction FROM active_positions WHERE status = 'OPEN'")
+            existing_open = cur.fetchall()
+            if not any(r[1] == new_dir for r in existing_open):
+                cur.execute(
+                    """
+                    INSERT INTO active_positions (
+                        opened_utc, direction, entry_price, initial_sl, current_sl,
+                        tp1, tp2, tp3, atr_at_entry, tp1_hit, peak_favorable_price,
+                        status, updated_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'OPEN', ?)
+                    """,
+                    (
+                        now_iso, new_dir, entry_price, sl, sl,
+                        tp1, tp2, tp3, current_atr, entry_price, now_iso,
+                    ),
+                )
+                protocol_status = "Active @ TP1 Breakeven"
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return protocol_status
+
+
+# ==============================================================================
+# MASTER SIGNAL SYNTHESIS & FORMATTING
+# ==============================================================================
+def run_full_quant_evaluation(command_listener_status: str = "Active / Ready for /check") -> SignalReport:
+    """
+    Executes the end-to-end 5-Pillar + Grid Search + Chart + Trailing Stop pipeline.
+    """
+    session_status = evaluate_market_session()
+    df_15m, df_1h, data_source = fetch_xauusd_mtf_data()
+
+    # 1. Grid Search Optimization
+    grid_res = run_grid_search_optimization(df_15m, df_1h)
+    generate_backtest_chart(df_15m, grid_res, CHART_PATH)
+
+    # 2. Evaluate Pillars I - IV
+    p1 = analyze_pillar_1_smc(df_15m)
+    p2 = analyze_pillar_2_order_flow(df_15m)
+    p3 = analyze_pillar_3_zscore(df_15m, z_threshold=grid_res.optimal_z_threshold)
+    p4 = analyze_pillar_4_mtf_harmony(df_15m, df_1h)
+
+    # Directional Consensus Voting
+    bull_score = 0
+    bear_score = 0
+    for pillar in (p1, p2, p3, p4):
+        if pillar["bias"] == "BULLISH":
+            bull_score += pillar["points"]
+        elif pillar["bias"] == "BEARISH":
+            bear_score += pillar["points"]
+        else:
+            bull_score += pillar["points"] // 2
+            bear_score += pillar["points"] // 2
+
+    dominant_dir = "BULLISH" if bull_score >= bear_score else "BEARISH"
+    p5 = analyze_pillar_5_atr_risk(
+        df_15m=df_15m,
+        direction=dominant_dir,
+        optimal_atr_period=grid_res.optimal_atr_period,
+    )
+
+    total_bull = min(100, bull_score + (p5["points"] if dominant_dir == "BULLISH" else 0))
+    total_bear = min(100, bear_score + (p5["points"] if dominant_dir == "BEARISH" else 0))
+    confluence_score = max(total_bull, total_bear)
+
+    if total_bull >= CONFLUENCE_THRESHOLD and total_bull > total_bear + 8:
+        signal_decision = "VERIFIED BUY"
+    elif total_bear >= CONFLUENCE_THRESHOLD and total_bear > total_bull + 8:
+        signal_decision = "VERIFIED SELL"
+    else:
+        signal_decision = "NEUTRAL / HOLD"
+
+    # 3. Auto-Trailing Stop State Update
+    trailing_status = update_auto_trailing_stop_engine(
+        current_price=p5["entry"],
+        current_atr=p5["atr_exec"],
+        new_signal_decision=signal_decision,
+        entry_price=p5["entry"],
+        sl=p5["sl"],
+        tp1=p5["tp1"],
+        tp2=p5["tp2"],
+        tp3=p5["tp3"],
+    )
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+    candle_ts = df_15m.index[-1].isoformat()
+
+    return SignalReport(
+        timestamp_utc=now_utc,
+        candle_timestamp_utc=candle_ts,
+        asset=ASSET_LABEL,
+        data_source=data_source,
+        session_status=session_status,
+        signal_decision=signal_decision,
+        entry_price=p5["entry"],
+        stop_loss=p5["sl"],
+        tp1=p5["tp1"],
+        tp2=p5["tp2"],
+        tp3=p5["tp3"],
+        trailing_stop_protocol=trailing_status,
+        confluence_score=int(confluence_score),
+        z_score=round(p3["z_score"], 4),
+        smc_state=p1["state"],
+        order_flow_state=p2["state"],
+        mtf_harmony_state=p4["state"],
+        atr_value=p5["atr_exec"],
+        optimal_atr_period=grid_res.optimal_atr_period,
+        optimal_z_threshold=grid_res.optimal_z_threshold,
+        recommended_lot=p5["recommended_lot"],
+        risk_amount_usd=p5["risk_amount_usd"],
+        win_rate=grid_res.win_rate,
+        profit_factor=grid_res.profit_factor,
+        max_drawdown=grid_res.max_drawdown,
+        command_listener_status=command_listener_status,
+        webhook_status="Delivered via Exponential Backoff",
+        pillar_breakdown={
+            "P1_SMC": p1,
+            "P2_OrderFlow": p2,
+            "P3_ZScore": p3,
+            "P4_MTFHarmony": p4,
+            "P5_ATRRisk": p5,
+        },
+    )
+
+
+def format_institutional_telegram_report(report: SignalReport) -> str:
+    """Formats the exact institutional forensic HTML template for Telegram."""
+    return (
+        f"🛡️ <b>APEX-QUANT-OMNI SOVEREIGN {ENGINE_VERSION} (2-WAY COMMAND EDITION)</b> 🛡️\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌟 <b>Asset:</b> {report.asset}\n"
+        f"📊 <b>Signal Decision:</b> {report.signal_decision}\n"
+        f"🎯 <b>Precision Entry:</b> {report.entry_price:.2f}\n"
+        f"🛑 <b>Forensic Stop Loss:</b> {report.stop_loss:.2f}\n"
+        f"📈 <b>Take Profit 1 (1.5R):</b> {report.tp1:.2f}\n"
+        f"📈 <b>Take Profit 2 (2.5R):</b> {report.tp2:.2f}\n"
+        f"🚀 <b>Take Profit 3 (4.0R):</b> {report.tp3:.2f}\n"
+        f"🔄 <b>Trailing Stop Protocol:</b> {report.trailing_stop_protocol}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 <b>Interactive 2-Way Command Status:</b>\n"
+        f"• <i>Command Listener:</i> {report.command_listener_status}\n"
+        f"• <i>Multi-Source Feed:</i> {report.data_source}\n"
+        f"• <i>Session Governor:</i> {report.session_status.session_name} "
+        f"({'OPEN' if report.session_status.is_allowed else 'SUPPRESSED'})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚙️ <b>Grid Search &amp; Exponential Backoff:</b>\n"
+        f"• <i>Optimal ATR Period:</i> {report.optimal_atr_period}\n"
+        f"• <i>Optimal Z-Threshold:</i> {report.optimal_z_threshold:.1f}\n"
+        f"• <i>Live Z-Score / SMC:</i> {report.z_score:+.2f} | {report.smc_state}\n"
+        f"• <i>Webhook Status:</i> {report.webhook_status}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Risk &amp; Position Sizing:</b>\n"
+        f"• <i>Recommended Lot:</i> {report.recommended_lot:.2f} Lots ({DEFAULT_RISK_PERCENT:.1f}% Risk)\n"
+        f"• <i>Risk Amount (USD):</i> ${report.risk_amount_usd:.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔬 <b>Forensic Audit, DB Artifact &amp; Backtest:</b>\n"
+        f"• <i>Confluence Score:</i> {report.confluence_score}/100\n"
+        f"• <i>SQLite Artifact:</i> Saved &amp; Uploaded\n"
+        f"• <i>Optimized Win Rate:</i> {report.win_rate:.1f}%\n"
+        f"• <i>Profit Factor:</i> {report.profit_factor:.2f}\n"
+        f"• <i>Max Drawdown:</i> {report.max_drawdown:.1f}%\n"
+        f"• <i>Timestamp (UTC):</i> {report.timestamp_utc}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+# ==============================================================================
+# INTERACTIVE 2-WAY TELEGRAM COMMAND HANDLER (/check, /status, /chart, /help)
+# ==============================================================================
+def _build_status_message() -> str:
+    session = evaluate_market_session()
+    init_sqlite_db(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM signals_audit")
+        total_rows = cur.fetchone()[0]
+        cur.execute(
+            "SELECT timestamp_utc, signal_decision, entry_price, confluence_score "
+            "FROM signals_audit ORDER BY id DESC LIMIT 1"
+        )
+        last_row = cur.fetchone()
+    finally:
+        conn.close()
+
+    last_summary = (
+        f"{last_row[1]} @ {last_row[2]:.2f} ({last_row[3]}/100) [{last_row[0]}]"
+        if last_row
+        else "No signals logged yet"
+    )
+    return (
+        f"🩺 <b>APEX-QUANT-OMNI {ENGINE_VERSION} — SYSTEM HEALTH STATUS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Engine State:</b> ONLINE &amp; OPERATIONAL\n"
+        f"• <b>Session Governor:</b> {session.session_name} "
+        f"({'ACTIVE' if session.is_allowed else 'SUPPRESSED'})\n"
+        f"• <b>Session Note:</b> {session.reason}\n"
+        f"• <b>SQLite Audit Records:</b> {total_rows}\n"
+        f"• <b>Latest Audit Entry:</b> {last_summary}\n"
+        f"• <b>UTC Clock:</b> {session.utc_timestamp}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Commands: <code>/check</code> | <code>/status</code> | <code>/chart</code> | <code>/help</code>"
+    )
+
+
+def process_telegram_commands(poll_timeout: int = 0) -> int:
+    """
+    Polls Telegram Bot API `getUpdates` for interactive 2-way user commands:
+      - /check  : Runs on-demand live XAUUSD quantitative analysis & replies immediately
+      - /status : Reports system health, SQLite state, and Session Governor status
+      - /chart  : Sends the latest backtest_performance.png equity curve
+      - /help   : Lists available interactive commands
+    Returns the number of commands processed.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        logger.info("TELEGRAM_BOT_TOKEN missing; skipping 2-way command polling.")
+        return 0
+
+    last_offset_str = get_bot_state("telegram_update_offset", "0")
+    offset = int(last_offset_str) if last_offset_str.isdigit() else 0
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params: Dict[str, Any] = {"offset": offset, "timeout": poll_timeout, "allowed_updates": ["message"]}
+    resp = request_with_exponential_backoff(
+        "GET", url, max_retries=2, backoff_delays=(2, 4), timeout=poll_timeout + 10, params=params
+    )
+    if resp is None or resp.status_code != 200:
+        return 0
+
+    try:
+        updates = resp.json().get("result", [])
+    except (ValueError, AttributeError):
+        return 0
+
+    processed = 0
+    for upd in updates:
+        upd_id = int(upd.get("update_id", 0))
+        if upd_id >= offset:
+            offset = upd_id + 1
+            set_bot_state("telegram_update_offset", str(offset))
+
+        msg = upd.get("message") or {}
+        text = str(msg.get("text", "")).strip()
+        chat_id = str((msg.get("chat") or {}).get("id", "")).strip()
+        if not text or not chat_id:
+            continue
+
+        # Authorization guard when TELEGRAM_CHAT_ID is explicitly set
+        if TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
+            logger.warning(f"Ignored unauthorized Telegram command from chat_id={chat_id}")
+            continue
+
+        cmd = text.split()[0].split("@")[0].lower()
+        logger.info(f"Received 2-Way Telegram command [{cmd}] from chat_id={chat_id}")
+
+        if cmd == "/check":
+            send_telegram_message("⏳ <i>Executing live XAUUSD 5-Pillar + Grid Search scan...</i>", chat_id=chat_id)
+            report = run_full_quant_evaluation(command_listener_status="Active (On-Demand /check Executed)")
+            report.webhook_status = "On-Demand /check Reply (Exponential Backoff)"
+            forensic_audit_log(report)
+            send_telegram_message(format_institutional_telegram_report(report), chat_id=chat_id)
+            if os.path.exists(CHART_PATH):
+                send_telegram_photo(CHART_PATH, caption="📊 Live Grid-Optimized Backtest Curve", chat_id=chat_id)
+            processed += 1
+
+        elif cmd == "/status":
+            send_telegram_message(_build_status_message(), chat_id=chat_id)
+            processed += 1
+
+        elif cmd == "/chart":
+            if not os.path.exists(CHART_PATH):
+                df_15m, df_1h, _ = fetch_xauusd_mtf_data()
+                grid_res = run_grid_search_optimization(df_15m, df_1h)
+                generate_backtest_chart(df_15m, grid_res, CHART_PATH)
+            send_telegram_photo(CHART_PATH, caption="📈 APEX-QUANT-OMNI Backtest Performance", chat_id=chat_id)
+            processed += 1
+
+        elif cmd in ("/help", "/start"):
+            help_msg = (
+                f"🤖 <b>APEX-QUANT-OMNI {ENGINE_VERSION} Interactive Commands</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <code>/check</code> — Live XAUUSD Signal, Z-Score, SMC &amp; Confluence Scan\n"
+                f"• <code>/status</code> — System Health, Session Governor &amp; SQLite Audit\n"
+                f"• <code>/chart</code> — Latest Grid-Optimized Equity Curve Chart\n"
+                f"• <code>/help</code> — Show this command menu"
+            )
+            send_telegram_message(help_msg, chat_id=chat_id)
+            processed += 1
+
+    return processed
+
+
+# ==============================================================================
+# EXECUTION ORCHESTRATION (ONESHOT SERVERLESS & CONTINUOUS 2-WAY POLLING)
+# ==============================================================================
+def execute_scheduled_cycle(force_notify: bool = False) -> None:
+    """
+    Runs one complete serverless cycle:
+      1. Handles any pending 2-way Telegram user commands (/check, /status, /chart)
+      2. Checks Market Session Governor
+      3. Runs 5-Pillar Quant Engine + Grid Search + SQLite Audit + Chart
+      4. Dispatches webhooks via Exponential Backoff on verified signals (deduped per candle)
+    """
+    init_sqlite_db(DB_PATH)
+    process_telegram_commands(poll_timeout=0)
+
+    session = evaluate_market_session()
+    report = run_full_quant_evaluation(command_listener_status="Active / Ready for /check")
+
+    last_notified_candle = get_bot_state("last_notified_candle_utc", "")
+    is_new_candle = report.candle_timestamp_utc != last_notified_candle
+    is_verified = "VERIFIED" in report.signal_decision
+
+    if not session.is_allowed and not force_notify:
+        report.webhook_status = f"Suppressed by Session Governor ({session.session_name})"
+        forensic_audit_log(report)
+        logger.info(f"Automated alert suppressed: {session.reason}")
+        return
+
+    if (is_verified and is_new_candle) or force_notify:
+        tg_ok = send_telegram_message(format_institutional_telegram_report(report))
+        if tg_ok and os.path.exists(CHART_PATH):
+            send_telegram_photo(CHART_PATH, caption=f"📊 {report.asset} | {report.signal_decision}")
+        dc_ok = send_discord_webhook(report)
+
+        if tg_ok or dc_ok:
+            report.webhook_status = "Delivered via Exponential Backoff"
+            set_bot_state("last_notified_candle_utc", report.candle_timestamp_utc)
+        else:
+            report.webhook_status = "Logged Locally (No Webhook Target Configured/Reached)"
+    else:
+        report.webhook_status = "Standby (Neutral Confluence or Already Notified)"
+
+    forensic_audit_log(report)
+
+
+def run_continuous_polling_loop(scan_interval_sec: int = 900) -> None:
+    """
+    Runs a persistent 2-way Telegram command listener with periodic 15-minute
+    scheduled quantitative scans (for VPS / long-running container deployments).
+    """
+    logger.info(f"Starting continuous 2-Way Telegram Listener + {scan_interval_sec}s scan loop...")
+    last_scan_ts = 0.0
+    while True:
+        try:
+            process_telegram_commands(poll_timeout=15)
+            now_ts = time.time()
+            if now_ts - last_scan_ts >= scan_interval_sec:
+                execute_scheduled_cycle(force_notify=False)
+                last_scan_ts = now_ts
+        except KeyboardInterrupt:
+            logger.info("Graceful shutdown requested.")
+            break
+        except Exception as exc:
+            logger.error(f"Error inside continuous loop: {exc}")
+            send_emergency_telegram_alert("Continuous Polling Loop", exc)
+            time.sleep(10)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="APEX-QUANT-OMNI SOVEREIGN v75.0 XAUUSD Engine"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["oneshot", "poll", "commands_only"],
+        default=os.getenv("BOT_MODE", "oneshot"),
+        help="Execution mode: oneshot (GitHub Actions), poll (24/7 listener), commands_only",
+    )
+    parser.add_argument(
+        "--force-notify",
+        action="store_true",
+        default=os.getenv("FORCE_NOTIFY", "false").lower() == "true",
+        help="Force webhook delivery even on NEUTRAL or suppressed session (manual diagnostic).",
+    )
+    args = parser.parse_args()
+
+    try:
+        if args.mode == "poll":
+            run_continuous_polling_loop()
+        elif args.mode == "commands_only":
+            count = process_telegram_commands(poll_timeout=2)
+            logger.info(f"Processed {count} interactive Telegram command(s).")
+        else:
+            execute_scheduled_cycle(force_notify=args.force_notify)
+    except Exception as exc:
+        logger.critical(f"Fatal unhandled exception in APEX-QUANT-OMNI: {exc}", exc_info=True)
+        send_emergency_telegram_alert("Top-Level Engine Execution", exc)
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
-
-# --- END SECTION 19 ---
