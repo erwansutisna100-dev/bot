@@ -1,4 +1,4 @@
-name: APEX-QUANT-OMNI SOVEREIGN v75.1 (XAUUSD Signal & 2-Way Bot)
+name: APEX-QUANT-OMNI SOVEREIGN v75.2 (XAUUSD Signal & News Guard Bot)
 
 on:
   schedule:
@@ -72,6 +72,8 @@ jobs:
           RISK_PERCENT: "1.0"
           CONFLUENCE_THRESHOLD: "65"
           MAX_ALLOWED_SPREAD_USD: "3.00"
+          NEWS_BLACKOUT_BEFORE_MIN: "45"
+          NEWS_BLACKOUT_AFTER_MIN: "30"
           BOT_MODE: ${{ github.event.inputs.mode || 'oneshot' }}
           FORCE_NOTIFY: ${{ github.event.inputs.force_notify || 'false' }}
           MPLBACKEND: "Agg"
