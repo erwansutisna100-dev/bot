@@ -1,76 +1,110 @@
-name: bot
+name: v75.0
 
 on:
   schedule:
-    - cron: "*/15 * * * 1-5"
+    # Every 15 minutes — institutional cadence aligned to 15m execution timeframe.
+    - cron: "*/15 * * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Execution mode (once = full cycle + listener, check = analysis only, listen = commands only)"
+        required: false
+        default: "once"
+        type: choice
+        options:
+          - once
+          - check
+          - listen
+      listen_seconds:
+        description: "Interactive Telegram 2-way command listener budget (seconds)"
+        required: false
+        default: "240"
+
+concurrency:
+  group: apex-quant-omni-sovereign
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  run-quant-engine:
-    name: Execute XAUUSD Quant Engine
+  apex-quant-omni:
+    name: XAUUSD Hybrid Quantitative Signal Engine
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      ACCOUNT_BALANCE: "10000"
+      RISK_PERCENT: "1.0"
+      CONTRACT_SIZE: "100"
+      DB_PATH: "trading_signals.db"
+      CHART_PATH: "backtest_performance.png"
+      POLL_SECONDS: "240"
+      PYTHONUNBUFFERED: "1"
+      MPLBACKEND: "Agg"
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set Up Python 3.11
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install Python Dependencies
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip wheel setuptools
           pip install -r requirements.txt
 
-      - name: Restore Persistent SQLite Signal Database
+      - name: Restore SQLite artifact from previous run
         uses: actions/cache@v4
         with:
           path: trading_signals.db
-          key: xauusd-sqlite-db-${{ github.run_id }}
+          key: apex-quant-db-${{ github.run_id }}
           restore-keys: |
-            xauusd-sqlite-db-
+            apex-quant-db-
 
-      - name: Verify Telegram Credentials
-        continue-on-error: true
+      - name: Execute sovereign engine
         run: |
-          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-            echo "::warning::TELEGRAM_BOT_TOKEN kosong"
-            exit 0
-          fi
-          GETME=$(curl -sS --max-time 15 \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe") || true
-          if echo "$GETME" | grep -q '"ok":true'; then
-            echo "✅ Token valid"
-          else
-            echo "::warning::Token invalid: $(echo "$GETME" | head -c 200)"
-          fi
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          MODE="${{ github.event.inputs.mode }}"
+          if [ -z "$MODE" ]; then MODE="once"; fi
+          LISTEN="${{ github.event.inputs.listen_seconds }}"
+          if [ -z "$LISTEN" ]; then LISTEN="240"; fi
+          echo "Launching engine :: mode=$MODE listen=$LISTEN"
+          python bot.py --mode "$MODE" --listen-seconds "$LISTEN"
 
-      - name: Run APEX-QUANT-OMNI ENTERPRISE v40.0
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          ACCOUNT_BALANCE: "10000.0"
-          RISK_PERCENTAGE: "1.0"
-          MPLBACKEND: "Agg"
-        run: python bot.py
-
-      - name: Upload Artifacts
+      - name: Upload forensic artifacts (SQLite DB + backtest chart)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: apex-artifacts-${{ github.run_number }}
+          name: apex-quant-omni-artifacts-${{ github.run_number }}
           path: |
-            backtest_performance.png
             trading_signals.db
+            backtest_performance.png
           if-no-files-found: warn
           retention-days: 30
+          compression-level: 6
+
+      - name: Emit run summary
+        if: always()
+        run: |
+          echo "### APEX-QUANT-OMNI SOVEREIGN v75.0" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Run Number:** ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Mode:** ${{ github.event.inputs.mode || 'once' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp (UTC):** $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_STEP_SUMMARY
+          if [ -f trading_signals.db ]; then
+            echo "- **SQLite Artifact:** present ($(du -h trading_signals.db | cut -f1))" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **SQLite Artifact:** MISSING" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f backtest_performance.png ]; then
+            echo "- **Backtest Chart:** present ($(du -h backtest_performance.png | cut -f1))" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Backtest Chart:** MISSING" >> $GITHUB_STEP_SUMMARY
+          fi
