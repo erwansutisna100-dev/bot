@@ -506,39 +506,45 @@ def send_emergency_alert(error_text: str) -> None:
 
 
 # ==============================================================================
-# 6. MULTI-SOURCE FALLBACK DATA PIPELINE
+# 6. MULTI-SOURCE FALLBACK DATA PIPELINE (v75.1 — YAHOO-SAFE)
 # ==============================================================================
+
+_last_yahoo_throttle: float = 0.0   # detik epoch saat terakhir kena 429
+
+
+def _yahoo_soft_backoff() -> None:
+    """Jeda ringan sebelum menyentuh Yahoo jika baru saja kena 429."""
+    global _last_yahoo_throttle
+    if _last_yahoo_throttle <= 0:
+        return
+    elapsed = time.time() - _last_yahoo_throttle
+    if elapsed < 4.0:
+        time.sleep(4.0 - elapsed)
 
 
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Collapse a yfinance MultiIndex column frame to its price-field level."""
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
         df.columns = df.columns.get_level_values(0)
     return df
 
 
-def _finalize_ohlcv(df: Optional[pd.DataFrame], min_rows: int = 60) -> Optional[pd.DataFrame]:
-    """Normalize any raw vendor frame into a clean UTC-indexed OHLCV frame."""
+def _finalize_ohlcv(df, min_rows: int = 60):
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return None
-
     df = _flatten_columns(df).copy()
     df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-    df = df.rename(columns={"adj_close": "close", "adj close": "close", "price": "close"})
-
+    df = df.rename(columns={"adj_close": "close", "price": "close"})
     for col in ("open", "high", "low", "close"):
         if col not in df.columns:
             return None
     if "volume" not in df.columns:
         df["volume"] = 0.0
-
     df = df[["open", "high", "low", "close", "volume"]]
     df = df.apply(pd.to_numeric, errors="coerce")
     df = df.dropna(subset=["open", "high", "low", "close"])
     if df.empty:
         return None
-
     if not isinstance(df.index, pd.DatetimeIndex):
         try:
             df.index = pd.to_datetime(df.index, utc=True)
@@ -548,7 +554,6 @@ def _finalize_ohlcv(df: Optional[pd.DataFrame], min_rows: int = 60) -> Optional[
         df.index = df.index.tz_localize("UTC")
     else:
         df.index = df.index.tz_convert("UTC")
-
     df = df[~df.index.duplicated(keep="last")].sort_index()
     df = df[df["high"] >= df["low"]]
     if len(df) < min_rows:
@@ -556,22 +561,25 @@ def _finalize_ohlcv(df: Optional[pd.DataFrame], min_rows: int = 60) -> Optional[
     return df
 
 
-def source_yfinance(symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
-    """Primary feed: yfinance official Spot Gold ('XAUUSD=X')."""
-    raw = yf.download(
-        symbol,
-        interval=interval,
-        period=period,
-        progress=False,
-        auto_adjust=False,
-        threads=False,
-    )
+def source_yfinance(symbol: str, interval: str, period: str):
+    _yahoo_soft_backoff()
+    try:
+        raw = yf.download(
+            symbol, interval=interval, period=period,
+            progress=False, auto_adjust=False, threads=False,
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "404" in msg or "delisted" in msg.lower():
+            raise RuntimeError(f"symbol {symbol} delisted on Yahoo") from exc
+        raise
     return _finalize_ohlcv(raw)
 
 
-def source_yahoo_chart_api(symbol: str, interval: str, range_: str) -> Optional[pd.DataFrame]:
-    """Secondary feed: raw Yahoo Finance v8 chart endpoint (query1 -> query2)."""
-    last_error: Optional[Exception] = None
+def source_yahoo_chart_api(symbol: str, interval: str, range_: str):
+    global _last_yahoo_throttle
+    _yahoo_soft_backoff()
+    last_error = None
     for host in ("https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"):
         try:
             url = (
@@ -579,74 +587,93 @@ def source_yahoo_chart_api(symbol: str, interval: str, range_: str) -> Optional[
                 f"?interval={interval}&range={range_}&includePrePost=false"
             )
             resp = requests.get(url, headers=UA_HEADERS, timeout=HTTP_TIMEOUT)
+            if resp.status_code == 429:
+                _last_yahoo_throttle = time.time()
+                raise RuntimeError("HTTP 429 rate limit")
             resp.raise_for_status()
             payload = resp.json()
-
             result = payload["chart"]["result"][0]
-            timestamps = result.get("timestamp") or []
-            if not timestamps:
+            ts = result.get("timestamp") or []
+            if not ts:
                 raise RuntimeError("empty timestamp array")
-
-            quote_block = result["indicators"]["quote"][0]
-            index = pd.to_datetime(timestamps, unit="s", utc=True)
+            q = result["indicators"]["quote"][0]
             frame = pd.DataFrame(
                 {
-                    "open": quote_block.get("open"),
-                    "high": quote_block.get("high"),
-                    "low": quote_block.get("low"),
-                    "close": quote_block.get("close"),
-                    "volume": quote_block.get("volume") or [0] * len(timestamps),
+                    "open": q.get("open"),
+                    "high": q.get("high"),
+                    "low": q.get("low"),
+                    "close": q.get("close"),
+                    "volume": q.get("volume") or [0] * len(ts),
                 },
-                index=index,
+                index=pd.to_datetime(ts, unit="s", utc=True),
             )
             cleaned = _finalize_ohlcv(frame)
             if cleaned is not None:
                 return cleaned
             raise RuntimeError("insufficient cleaned rows")
         except Exception as exc:
+            if "429" in str(exc):
+                _last_yahoo_throttle = time.time()
             last_error = exc
             log.warning("Yahoo chart API host %s failed: %s", host, exc)
-
     if last_error:
         raise last_error
     return None
 
 
-def source_stooq_daily(symbol: str = "xauusd") -> Optional[pd.DataFrame]:
-    """Tertiary degraded feed: Stooq free daily CSV."""
+def source_stooq_daily(symbol: str = "xauusd"):
+    """
+    Stooq parser defensif: toleran terhadap BOM, header casing, dan
+    baris meta. Akan raise jika memang bukan CSV OHLCV valid.
+    """
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
     resp = requests.get(url, headers=UA_HEADERS, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
-    text = resp.text or ""
-    if "Date" not in text[:300]:
-        raise RuntimeError("stooq returned an unexpected payload")
+    text = (resp.text or "").lstrip("\ufeff").strip()
 
-    raw = pd.read_csv(io.StringIO(text))
-    if "Date" not in raw.columns or "Close" not in raw.columns:
-        raise RuntimeError("stooq schema mismatch")
+    if not text or "Date" not in text[:400]:
+        snippet = text[:200].replace("\n", " ")
+        raise RuntimeError(f"stooq unexpected payload: {snippet!r}")
 
-    raw["Date"] = pd.to_datetime(raw["Date"], utc=True, errors="coerce")
-    raw = raw.dropna(subset=["Date"]).set_index("Date")
-    return _finalize_ohlcv(raw)
+    try:
+        raw = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+    except Exception as exc:
+        raise RuntimeError(f"stooq csv parse failed: {exc}") from exc
+
+    raw.columns = [str(c).strip().lower() for c in raw.columns]
+    if "date" not in raw.columns or "close" not in raw.columns:
+        raise RuntimeError(f"stooq schema mismatch: {list(raw.columns)[:6]}")
+
+    raw["date"] = pd.to_datetime(raw["date"], utc=True, errors="coerce")
+    raw = raw.dropna(subset=["date"]).set_index("date")
+    return _finalize_ohlcv(raw, min_rows=60)
 
 
-DATA_SOURCES: Sequence[Tuple[str, Callable[[], Optional[pd.DataFrame]], bool]] = (
-    ("yfinance-XAUUSD=X-15m", lambda: source_yfinance("XAUUSD=X", "15m", "5d"), False),
-    ("yahoo-chart-XAUUSD=X-15m", lambda: source_yahoo_chart_api("XAUUSD=X", "15m", "5d"), False),
-    ("yfinance-XAUUSD=X-60m", lambda: source_yfinance("XAUUSD=X", "60m", "1mo"), False),
-    ("yahoo-chart-XAUUSD=X-60m", lambda: source_yahoo_chart_api("XAUUSD=X", "60m", "1mo"), False),
-    ("stooq-XAUUSD-1d", lambda: source_stooq_daily("xauusd"), True),
+# ------------------------------------------------------------------------------
+# TIER ORDER (v75.1)
+#   1. GC=F futures        -> paling andal di Yahoo, basis ~0.3% vs spot
+#   2. PAXG-USD gold token -> track spot dekat, 24/7
+#   3. GLD ETF             -> sangat likuid, proxy spot
+#   4. XAUUSD=X            -> dicoba lagi kalau Yahoo memulihkan
+#   5. Yahoo chart GC=F    -> fallback chart API untuk futures
+#   6. Stooq xauusd        -> daily degraded (last resort)
+# ------------------------------------------------------------------------------
+DATA_SOURCES = (
+    ("yfinance-GC=F-15m",         lambda: source_yfinance("GC=F", "15m", "5d"),        False),
+    ("yfinance-PAXG-USD-15m",     lambda: source_yfinance("PAXG-USD", "15m", "5d"),    False),
+    ("yfinance-GLD-15m",          lambda: source_yfinance("GLD", "15m", "5d"),         False),
+    ("yfinance-XAUUSD=X-15m",     lambda: source_yfinance("XAUUSD=X", "15m", "5d"),    False),
+    ("yahoo-chart-GC=F-15m",      lambda: source_yahoo_chart_api("GC=F", "15m", "5d"), False),
+    ("yahoo-chart-PAXG-USD-15m",  lambda: source_yahoo_chart_api("PAXG-USD", "15m", "5d"), False),
+    ("yahoo-chart-XAUUSD=X-15m",  lambda: source_yahoo_chart_api("XAUUSD=X", "15m", "5d"), False),
+    ("yfinance-GC=F-60m",         lambda: source_yfinance("GC=F", "60m", "1mo"),       False),
+    ("stooq-XAUUSD-1d",           lambda: source_stooq_daily("xauusd"),                True),
 )
 
 
-def fetch_market_data() -> Tuple[pd.DataFrame, str, bool]:
-    """
-    Sequentially probe every free feed until one returns a valid OHLCV frame.
-
-    Returns (dataframe, source_name, degraded_flag).
-    Raises RuntimeError only if every single source fails.
-    """
-    errors: List[str] = []
+def fetch_market_data():
+    """Probe setiap sumber sampai ada yang mengembalikan OHLCV valid."""
+    errors = []
     for name, loader, degraded in DATA_SOURCES:
         started = time.time()
         try:
@@ -657,17 +684,12 @@ def fetch_market_data() -> Tuple[pd.DataFrame, str, bool]:
             bar_delta = pd.Series(df.index).diff().median()
             log.info(
                 "Feed OK -> %s | rows=%d | bar=%s | latency=%.2fs | degraded=%s",
-                name,
-                len(df),
-                bar_delta,
-                elapsed,
-                degraded,
+                name, len(df), bar_delta, elapsed, degraded,
             )
             return df, name, degraded
         except Exception as exc:
             errors.append(f"{name}: {exc}")
             log.warning("Feed FAILED -> %s :: %s", name, exc)
-
     raise RuntimeError("ALL DATA SOURCES EXHAUSTED :: " + " || ".join(errors))
 
 
