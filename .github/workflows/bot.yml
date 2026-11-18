@@ -1,110 +1,89 @@
-name: v75.0
+name: APEX-QUANT-OMNI SOVEREIGN v75.0 (XAUUSD Signal & 2-Way Bot)
 
 on:
   schedule:
-    # Every 15 minutes — institutional cadence aligned to 15m execution timeframe.
+    # Runs every 15 minutes aligned with the 15M execution timeframe
     - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "Execution mode (once = full cycle + listener, check = analysis only, listen = commands only)"
-        required: false
-        default: "once"
+        description: "Execution mode (oneshot | commands_only)"
+        required: true
+        default: "oneshot"
         type: choice
         options:
-          - once
-          - check
-          - listen
-      listen_seconds:
-        description: "Interactive Telegram 2-way command listener budget (seconds)"
-        required: false
-        default: "240"
-
-concurrency:
-  group: apex-quant-omni-sovereign
-  cancel-in-progress: false
+          - oneshot
+          - commands_only
+      force_notify:
+        description: "Force Telegram & Discord diagnostic report even if NEUTRAL/suppressed"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 permissions:
   contents: read
+  actions: read
+
+concurrency:
+  group: apex-quant-omni-xauusd-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  apex-quant-omni:
-    name: XAUUSD Hybrid Quantitative Signal Engine
+  quant-signal-engine:
+    name: Run XAUUSD Quant Engine & Forensic Audit
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-      ACCOUNT_BALANCE: "10000"
-      RISK_PERCENT: "1.0"
-      CONTRACT_SIZE: "100"
-      DB_PATH: "trading_signals.db"
-      CHART_PATH: "backtest_performance.png"
-      POLL_SECONDS: "240"
-      PYTHONUNBUFFERED: "1"
-      MPLBACKEND: "Agg"
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set Up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: "requirements.txt"
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore SQLite artifact from previous run
-        uses: actions/cache@v4
-        with:
-          path: trading_signals.db
-          key: apex-quant-db-${{ github.run_id }}
-          restore-keys: |
-            apex-quant-db-
-
-      - name: Execute sovereign engine
+      - name: Restore Latest SQLite State Artifact (If Available)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          MODE="${{ github.event.inputs.mode }}"
-          if [ -z "$MODE" ]; then MODE="once"; fi
-          LISTEN="${{ github.event.inputs.listen_seconds }}"
-          if [ -z "$LISTEN" ]; then LISTEN="240"; fi
-          echo "Launching engine :: mode=$MODE listen=$LISTEN"
-          python bot.py --mode "$MODE" --listen-seconds "$LISTEN"
+          RUN_ID=$(gh run list --workflow="signal_bot.yml" --status=success --limit=1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+          if [ -n "$RUN_ID" ]; then
+            gh run download "$RUN_ID" -n apex-quant-forensic-artifacts || true
+          fi
 
-      - name: Upload forensic artifacts (SQLite DB + backtest chart)
+      - name: Execute APEX-QUANT-OMNI Sovereign Engine
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ACCOUNT_BALANCE: "10000.0"
+          RISK_PERCENT: "1.0"
+          CONFLUENCE_THRESHOLD: "65"
+          BOT_MODE: ${{ github.event.inputs.mode || 'oneshot' }}
+          FORCE_NOTIFY: ${{ github.event.inputs.force_notify || 'false' }}
+          MPLBACKEND: "Agg"
+        run: |
+          python bot.py --mode "${BOT_MODE}"
+
+      - name: Upload Forensic SQLite DB & Backtest Chart Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: apex-quant-omni-artifacts-${{ github.run_number }}
+          name: apex-quant-forensic-artifacts
           path: |
             trading_signals.db
             backtest_performance.png
-          if-no-files-found: warn
           retention-days: 30
-          compression-level: 6
-
-      - name: Emit run summary
-        if: always()
-        run: |
-          echo "### APEX-QUANT-OMNI SOVEREIGN v75.0" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Run Number:** ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Mode:** ${{ github.event.inputs.mode || 'once' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Timestamp (UTC):** $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_STEP_SUMMARY
-          if [ -f trading_signals.db ]; then
-            echo "- **SQLite Artifact:** present ($(du -h trading_signals.db | cut -f1))" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- **SQLite Artifact:** MISSING" >> $GITHUB_STEP_SUMMARY
-          fi
-          if [ -f backtest_performance.png ]; then
-            echo "- **Backtest Chart:** present ($(du -h backtest_performance.png | cut -f1))" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- **Backtest Chart:** MISSING" >> $GITHUB_STEP_SUMMARY
-          fi
+          if-no-files-found: warn
